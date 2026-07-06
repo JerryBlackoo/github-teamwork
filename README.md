@@ -29,6 +29,28 @@
 9. 等待 PR Guard、Commitlint、CI、Codex review 和人工 review 通过。
 10. 合并后关闭或自动关闭 issue，Project 状态和工时同步。
 
+## 搭配 Trellis 使用
+
+这套模板很适合和 Trellis 一起用，但两者职责要分清：
+
+- GitHub Issue / Project 是团队公开协作系统，负责派发任务、认领、依赖、验收、PR 关联和进度统计。
+- Trellis 是本地 AI 开发系统，负责让 agent 读取规范、沉淀 PRD、记录研究和执行上下文。
+- 一个公开任务可以对应一个本地 Trellis task，但公开事实仍以 GitHub Issue / Project / PR 为准。
+- 发布团队任务时先创建 GitHub Issue，不要只创建 `.trellis/tasks/`。
+- Agent 开始实现前，可以在本地创建或继续 Trellis task，并在 PRD 中引用 GitHub issue，例如 `Issue: #123`。
+- PR 合并前，Trellis task 应完成本地验证、记录关键决策，并按团队习惯归档；PR body 仍要填写 GitHub issue、验证命令和风险。
+
+推荐搭配流程：
+
+1. 协调人用 GitHub Issue 模板发布任务。
+2. 成员或 agent 评论 `认领：@用户名`，Project 进入 `In Progress`。
+3. 本地 agent 按 Trellis 流程创建/继续 task，读取 `AGENTS.md`、`CONTRIBUTING.md` 和相关 `docs/`。
+4. Trellis PRD 记录 GitHub issue、范围、验收标准和已读文档。
+5. 实现、测试、文档更新都在本地完成，并把验证结果写回 PR body。
+6. PR review 和 CI 通过后合并；GitHub issue / Project 完成公开收尾，Trellis task 完成本地归档。
+
+可以把这个模板中的 [AGENTS.md](AGENTS.md) 作为 Trellis 项目的根级 agent 说明起点，再按具体项目补充 `.trellis/spec/`、`.agents/skills/` 和本地 workflow。核心原则是：Trellis 让 AI 干活更稳，GitHub 让团队协作可见。
+
 ## 推荐目录
 
 ```text
