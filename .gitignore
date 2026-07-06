@@ -1,0 +1,19 @@
+# OS and editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temp
+*.log
+tmp/
+temp/
+
+# Local AI/runtime state
+.local/
+.trellis/workspace/

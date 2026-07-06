@@ -1,0 +1,40 @@
+name: Docs Check
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'docs/**'
+      - '*.md'
+      - '.github/**'
+  push:
+    branches: [develop]
+    paths:
+      - 'docs/**'
+      - '*.md'
+      - '.github/**'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate labeler JSON
+        run: python -m json.tool .github/labeler.json > /tmp/labeler.json
+
+      - name: Check required templates
+        run: |
+          test -f .github/pull_request_template.md
+          test -f .github/ISSUE_TEMPLATE/task_issue.md
+          test -f .github/ISSUE_TEMPLATE/test_task_issue.md
+          test -f docs/collaboration/repository-setup.md
+          test -f docs/collaboration/task-issue-project-workflow.md
+          test -f docs/testing/templates/test-report-template.md
+
+      - name: Check whitespace
+        run: git diff --check

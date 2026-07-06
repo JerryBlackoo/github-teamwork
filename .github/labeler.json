@@ -1,0 +1,46 @@
+{
+  "accountLabels": [
+    {
+      "accounts": [],
+      "labels": ["team:frontend"]
+    },
+    {
+      "accounts": [],
+      "labels": ["team:backend"]
+    },
+    {
+      "accounts": [],
+      "labels": ["team:qa"]
+    }
+  ],
+  "pathLabels": [
+    {
+      "paths": ["apps/web/**", "frontend/**"],
+      "labels": ["area:frontend"]
+    },
+    {
+      "paths": ["services/**", "backend/**", "api/**"],
+      "labels": ["area:backend"]
+    },
+    {
+      "paths": ["deploy/**", "infra/**", "scripts/**"],
+      "labels": ["area:devops"]
+    },
+    {
+      "paths": [".github/workflows/**", ".github/labeler.json"],
+      "labels": ["ci"]
+    },
+    {
+      "paths": ["docs/**", "*.md", ".github/pull_request_template.md"],
+      "labels": ["area:docs"]
+    },
+    {
+      "paths": ["tests/**", "e2e/**", "docs/testing/**"],
+      "labels": ["area:testing"]
+    },
+    {
+      "paths": ["AGENTS.md", ".agents/**", ".trellis/**"],
+      "labels": ["team:special"]
+    }
+  ]
+}
