@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Enforce collaboration rules
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           ALLOWED_BASE_BRANCHES: develop
           OWNER_DIRECT_BRANCH_USERS: ${{ github.repository_owner }}

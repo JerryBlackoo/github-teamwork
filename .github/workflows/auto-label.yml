@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Apply configured labels and blocked state
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const configPath = '.github/labeler.json';

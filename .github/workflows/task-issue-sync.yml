@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Sync task issue metadata
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
