@@ -15,10 +15,6 @@ permissions:
   issues: write
   repository-projects: write
 
-concurrency:
-  group: task-issue-${{ github.repository_id }}-${{ github.event.issue.number || inputs.issue_number }}
-  cancel-in-progress: false
-
 jobs:
   sync:
     if: ${{ github.event_name == 'workflow_dispatch' || !github.event.issue.pull_request }}
