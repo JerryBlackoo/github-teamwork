@@ -337,12 +337,10 @@ const createSyncGithub = ({
   title = 'Team Project',
   fields = projectFields(),
   onFieldUpdate,
-  initialComments = [],
 }) => {
   const usesIssueSequence = Array.isArray(latestIssue);
   const issueVersions = usesIssueSequence ? latestIssue : [latestIssue];
   let currentIssue = clone(issueVersions[0]);
-  const comments = clone(initialComments);
   const calls = {
     get: [],
     graphql: [],
@@ -368,24 +366,10 @@ const createSyncGithub = ({
           return { data: clone(issue) };
         },
         listLabelsForRepo,
-        async listComments() { return clone(comments); },
         async addLabels(args) { calls.addLabels.push(args); },
         async update(args) {
           calls.update.push(args);
           if (!usesIssueSequence) currentIssue.body = args.body;
-        },
-        async createComment(args) {
-          calls.createComment.push(args);
-          comments.push({
-            id: 8000 + comments.length,
-            body: args.body,
-            user: { login: 'github-actions[bot]' },
-          });
-        },
-        async updateComment(args) {
-          calls.updateComment.push(args);
-          const comment = comments.find((candidate) => candidate.id === args.comment_id);
-          if (comment) comment.body = args.body;
         },
       },
     },
@@ -429,14 +413,11 @@ const createSyncGithub = ({
     github,
     calls,
     readIssue: () => clone(currentIssue),
-    readComments: () => clone(comments),
   };
 };
 
-const syncContext = (eventIssue, runId = 24680) => ({
+const syncContext = (eventIssue) => ({
   eventName: 'issues',
-  runId,
-  serverUrl: 'https://github.com',
   repo: { owner: 'acme', repo: 'widgets' },
   payload: { issue: eventIssue },
 });
@@ -828,8 +809,8 @@ test('actual hours only update a managed task and preserve the latest body', asy
 test('task sync never updates the issue body and preserves free text changed during the run', async () => {
   assert.doesNotMatch(
     readWorkflow('task-issue-sync.yml'),
-    /github\.rest\.issues\.update\s*\(/u,
-    'Task Issue Sync must not PATCH an Issue body from a background synchronization run'
+    /task-project-sync-status|github\.rest\.issues\.(?:update|listComments|createComment|updateComment)\s*\(/u,
+    'Task Issue Sync must not persist synchronization status on an Issue'
   );
   const issue = taskIssue({ body: taskBody({ extra: 'ORIGINAL_FREE_TEXT' }) });
   const concurrentIssue = taskIssue({ body: taskBody({ extra: 'CONCURRENT_FREE_TEXT' }) });
@@ -898,58 +879,53 @@ test('task sync retries a stale Project write and converges to the latest source
   assert.match(readIssue().body, /- 实际工时（小时数）：`5`/u);
 });
 
-test('task sync reports repeated failures through one idempotent bot comment', async () => {
+test('task sync reports configuration failures without writing the issue', async () => {
   const issue = taskIssue();
-  const { github, calls, readComments } = createSyncGithub({
+  const { github, calls } = createSyncGithub({
     latestIssue: issue,
     title: 'Different Project',
   });
 
-  const firstRun = await runWorkflowScript('task-issue-sync.yml', {
-    github,
-    context: syncContext(issue),
-    env: syncEnv,
-  });
-  const secondRun = await runWorkflowScript('task-issue-sync.yml', {
-    github,
-    context: syncContext(issue, 24681),
-    env: syncEnv,
-  });
-
-  assert.equal(firstRun.failures.length, 1);
-  assert.equal(secondRun.failures.length, 1);
-  assert.equal(calls.update.length, 0);
-  assert.equal(calls.createComment.length, 1);
-  assert.equal(calls.updateComment.length, 1);
-  assert.equal(readComments().length, 1);
-  assert.match(readComments()[0].body, /<!-- task-project-sync-status -->/u);
-  assert.match(readComments()[0].body, /blocked/iu);
-  assert.match(readComments()[0].body, /Different Project/u);
-  assert.match(readComments()[0].body, /https:\/\/github\.com\/acme\/widgets\/actions\/runs\/24681/u);
-});
-
-test('task sync marks an existing blocked bot comment as recovered after success', async () => {
-  const issue = taskIssue();
-  const { github, calls, readComments } = createSyncGithub({
-    latestIssue: issue,
-    initialComments: [{
-      id: 77,
-      body: '<!-- task-project-sync-status -->\nProject sync blocked.',
-      user: { login: 'github-actions[bot]' },
-    }],
-  });
-
-  await runWorkflowScript('task-issue-sync.yml', {
+  const result = await runWorkflowScript('task-issue-sync.yml', {
     github,
     context: syncContext(issue),
     env: syncEnv,
   });
 
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /sync blocked/u);
+  assert.match(result.failures[0], /Different Project/u);
   assert.equal(calls.update.length, 0);
   assert.equal(calls.createComment.length, 0);
-  assert.equal(calls.updateComment.length, 1);
-  assert.match(readComments()[0].body, /<!-- task-project-sync-status -->/u);
-  assert.match(readComments()[0].body, /恢复/u);
+  assert.equal(calls.updateComment.length, 0);
+});
+
+test('task sync reports an unstable source without writing the issue', async () => {
+  const issue = taskIssue();
+  const { github, calls } = createSyncGithub({
+    latestIssue: issue,
+    onFieldUpdate: async ({ count, setIssue }) => {
+      setIssue(taskIssue({
+        body: taskBody().replace(
+          '- 实际工时（小时数）：`0`',
+          `- 实际工时（小时数）：\`${count}\``
+        ),
+      }));
+    },
+  });
+
+  const result = await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue),
+    env: syncEnv,
+  });
+
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /sync blocked/u);
+  assert.match(result.failures[0], /source changed/iu);
+  assert.equal(calls.update.length, 0);
+  assert.equal(calls.createComment.length, 0);
+  assert.equal(calls.updateComment.length, 0);
 });
 
 test('task sync validates Project identity and the complete schema before mutations', async (t) => {
