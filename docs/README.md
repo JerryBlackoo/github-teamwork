@@ -10,6 +10,7 @@
 4. 文档维护者读 [collaboration/documentation-workflow.md](collaboration/documentation-workflow.md)。
 5. 测试负责人读 [testing/strategy.md](testing/strategy.md)。
 6. 使用 AI agent 的人读 [collaboration/agent-workflow.md](collaboration/agent-workflow.md)。
+7. 新仓库维护者按 [templates/project-kickoff-checklist.md](templates/project-kickoff-checklist.md) 完成启动检查。
 
 ## 目录说明
 

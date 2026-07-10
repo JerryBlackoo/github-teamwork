@@ -22,7 +22,7 @@
 - `Task Issue Sync` 自动识别标准任务 issue。
 - 自动同步 Project 状态、分组、优先级、模块、风险、依赖和工时。
 - 自动补 label。
-- 同步失败时 `Project sync` 写为 `blocked`，维护者查看 workflow 日志。
+- 同步状态以 `Task Issue Sync` workflow run 为准；失败时维护者查看 run 日志。
 
 ## 4. 任务认领
 
@@ -58,6 +58,6 @@
 - 合并到 `develop`。
 - issue 被 PR 自动关闭或手动关闭。
 - Project 状态同步为 Done。
-- 实际工时自动回填，也可以评论 `实际工时：1.5` 手动修正。
+- 实际工时按 issue 正文已有值同步；维护者、协作者或当前 Assignee 可评论 `实际工时：1.5` 修正。
 - 测试任务归档证据。
 - 文档状态同步，不能把未合入能力写成已实现。

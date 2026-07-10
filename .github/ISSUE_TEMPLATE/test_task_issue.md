@@ -2,7 +2,7 @@
 name: Test Task Issue
 about: Create a tracked task for testing work and test execution follow-up
 title: '[Q-001] 中文测试任务标题'
-labels: 'testing'
+labels: 'area:testing'
 assignees: ''
 ---
 
@@ -29,7 +29,6 @@ assignees: ''
 - 依赖原因：写清楚依赖的接口、schema、数据结构、环境变量、服务能力或验收条件。
 - 建议分支：`QA/test/short-title`
 - GitHub Project：`Team Project`
-- Project sync：`pending / synced / blocked`
 
 ## 发布前检查
 

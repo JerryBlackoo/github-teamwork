@@ -75,6 +75,7 @@ const taskIssue = (overrides = {}) => ({
   title: '[B-001] Implement API',
   body: taskBody(),
   state: 'open',
+  author_association: 'MEMBER',
   assignees: [],
   labels: [],
   ...overrides,
@@ -101,8 +102,63 @@ const claimContext = (
   },
 });
 
+const prGuardContext = (verification) => ({
+  repo: { owner: 'acme', repo: 'widgets' },
+  payload: {
+    pull_request: {
+      title: 'fix(workflows): reject template placeholders',
+      body: [
+        '## 修改内容',
+        '',
+        '- 修复 PR 验证信息校验。',
+        '',
+        '## 关联 Issue',
+        '',
+        '- 无。原因：仓库规则加固，不对应独立任务。',
+        '',
+        '## 验证',
+        '',
+        verification,
+        '',
+        '## 已知风险',
+        '',
+        '- 无。',
+      ].join('\n'),
+      base: {
+        ref: 'develop',
+        repo: { full_name: 'acme/widgets' },
+      },
+      head: {
+        ref: 'fix/pr-guard',
+        repo: {
+          fork: true,
+          full_name: 'alice/widgets',
+          owner: { login: 'alice' },
+        },
+      },
+      user: { login: 'alice' },
+    },
+  },
+});
+
+const prGuardGithub = {
+  rest: {
+    repos: {
+      async compareCommitsWithBasehead() {
+        return { data: { status: 'ahead' } };
+      },
+    },
+  },
+};
+
+const prGuardEnv = {
+  ALLOWED_BASE_BRANCHES: 'develop',
+  OWNER_DIRECT_BRANCH_USERS: 'acme',
+};
+
 const createClaimGithub = (latestIssue) => {
   const issueVersions = Array.isArray(latestIssue) ? latestIssue : [latestIssue];
+  let currentIssue = clone(issueVersions[0]);
   const calls = {
     get: [],
     addAssignees: [],
@@ -115,11 +171,17 @@ const createClaimGithub = (latestIssue) => {
       issues: {
         async get(args) {
           calls.get.push(args);
-          return { data: issueVersions[Math.min(calls.get.length - 1, issueVersions.length - 1)] };
+          const versionIndex = calls.get.length - 1;
+          if (versionIndex < issueVersions.length) currentIssue = clone(issueVersions[versionIndex]);
+          return { data: clone(currentIssue) };
         },
         async addAssignees(args) { calls.addAssignees.push(args); },
         async removeAssignees(args) { calls.removeAssignees.push(args); },
-        async update(args) { calls.update.push(args); },
+        async update(args) {
+          calls.update.push(args);
+          currentIssue.body = args.body;
+          return { data: clone(currentIssue) };
+        },
         async createComment(args) { calls.comments.push(args); },
       },
     },
@@ -337,6 +399,10 @@ const createSyncGithub = ({
   title = 'Team Project',
   fields = projectFields(),
   onFieldUpdate,
+  repositoryLabels = [
+    { name: 'team:backend' },
+    { name: 'area:docs' },
+  ],
 }) => {
   const usesIssueSequence = Array.isArray(latestIssue);
   const issueVersions = usesIssueSequence ? latestIssue : [latestIssue];
@@ -347,14 +413,12 @@ const createSyncGithub = ({
     projectMutations: [],
     fieldUpdates: [],
     addLabels: [],
+    removeLabel: [],
     update: [],
     createComment: [],
     updateComment: [],
   };
-  const listLabelsForRepo = async () => [
-    { name: 'team:backend' },
-    { name: 'area:docs' },
-  ];
+  const listLabelsForRepo = async () => repositoryLabels;
   const github = {
     rest: {
       issues: {
@@ -367,6 +431,7 @@ const createSyncGithub = ({
         },
         listLabelsForRepo,
         async addLabels(args) { calls.addLabels.push(args); },
+        async removeLabel(args) { calls.removeLabel.push(args); },
         async update(args) {
           calls.update.push(args);
           if (!usesIssueSequence) currentIssue.body = args.body;
@@ -570,7 +635,7 @@ test('a delayed contender cannot displace a winner with an earlier assignment ev
   assert.deepEqual(calls.get('alice').removeAssignees[0].assignees, ['alice']);
 });
 
-test('two claim comments for the same login bind one assignment epoch to one comment token', async () => {
+test('two claim comments for the same login bind the assignment to the latest valid token', async () => {
   const runnerKeys = ['first', 'second'];
   const issue = taskIssue();
   const { state, calls, githubFor } = createClaimHarness({
@@ -593,10 +658,12 @@ test('two claim comments for the same login bind one assignment epoch to one com
   })));
 
   assert.deepEqual(state.issue.assignees.map((assignee) => assignee.login), ['alice']);
-  assert.equal(calls.get('first').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
-  assert.equal(calls.get('second').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 0);
+  assert.equal(calls.get('first').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 0);
+  assert.equal(calls.get('second').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
+  assert.equal(calls.get('first').removeAssignees.length, 0);
   assert.equal(calls.get('second').removeAssignees.length, 0);
-  assert.equal(calls.get('second').projectUpdates.length, 0);
+  assert.equal(calls.get('first').projectUpdates.length, 0);
+  assert.equal(calls.get('second').projectUpdates.length, 10);
 });
 
 test('a new comment owns a reassigned login after the previous assignment epoch ends', async () => {
@@ -632,6 +699,38 @@ test('a new comment owns a reassigned login after the previous assignment epoch 
     env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
   });
 
+  assert.equal(calls.get('alice').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
+  assert.equal(calls.get('alice').removeAssignees.length, 0);
+});
+
+test('a new claim comment supersedes an old comment that never created an assignment', async () => {
+  const issue = taskIssue();
+  const comments = [
+    {
+      id: 900,
+      body: '认领：@alice',
+      user: { login: 'alice' },
+      created_at: '2026-07-09T01:00:00Z',
+    },
+    {
+      id: 1000,
+      body: '认领：@alice',
+      user: { login: 'alice' },
+      created_at: '2026-07-10T01:00:00Z',
+    },
+  ];
+  const { state, calls, githubFor } = createClaimHarness({
+    initialIssue: issue,
+    initialComments: comments,
+  });
+
+  await runWorkflowScript('task-claim.yml', {
+    github: githubFor('alice'),
+    context: claimContext(issue, '认领：@alice', 'alice', 1000, '2026-07-10T01:00:00Z'),
+    env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
+  });
+
+  assert.match(state.issue.body, /- 状态：`In Progress`/u);
   assert.equal(calls.get('alice').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
   assert.equal(calls.get('alice').removeAssignees.length, 0);
 });
@@ -797,7 +896,7 @@ test('actual hours only update a managed task and preserve the latest body', asy
       context: claimContext(eventIssue, '实际工时：2'),
       env: syncEnv,
     });
-    assert.equal(calls.get.length, 2);
+    assert.equal(calls.get.length, 4);
     assert.equal(calls.update.length, 1);
     assert.match(calls.update[0].body, /LATEST_WRITE_BASE/u);
     assert.match(calls.update[0].body, /- Project sync：`pending`/u);
@@ -1013,6 +1112,50 @@ test('task sync mutates the Project after a complete valid schema passes', async
   assert.equal(calls.updateComment.length, 0);
 });
 
+test('task sync ignores managed-looking issues from untrusted authors', async () => {
+  const issue = taskIssue({ author_association: 'NONE' });
+  const { github, calls } = createSyncGithub({ latestIssue: issue });
+
+  await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue),
+    env: syncEnv,
+  });
+
+  assert.deepEqual(calls.projectMutations, []);
+  assert.deepEqual(calls.addLabels, []);
+  assert.deepEqual(calls.removeLabel, []);
+});
+
+test('task sync replaces stale managed labels and preserves unrelated labels', async () => {
+  const issue = taskIssue({
+    labels: [
+      { name: 'team:frontend' },
+      { name: 'area:frontend' },
+      { name: 'security' },
+    ],
+  });
+  const { github, calls } = createSyncGithub({
+    latestIssue: issue,
+    repositoryLabels: [
+      { name: 'team:backend' },
+      { name: 'team:frontend' },
+      { name: 'area:docs' },
+      { name: 'area:frontend' },
+      { name: 'security' },
+    ],
+  });
+
+  await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue),
+    env: syncEnv,
+  });
+
+  assert.deepEqual(calls.addLabels[0].labels.sort(), ['area:docs', 'team:backend']);
+  assert.deepEqual(calls.removeLabel.map((call) => call.name).sort(), ['area:frontend', 'team:frontend']);
+});
+
 test('a PR is blocked when any closing issue is blocked', async () => {
   const pr = { number: 42, labels: [] };
   const linkedIssues = new Map([
@@ -1051,4 +1194,79 @@ test('a closing-issue lookup error preserves an existing blocked label', async (
   assert.equal(calls.addLabels.length, 0);
   assert.equal(calls.removeLabel.length, 0);
   assert.ok(result.warnings.some((message) => message.includes('#8')));
+});
+
+test('PR Guard rejects untouched verification placeholders', async () => {
+  const verification = [
+    '已运行：',
+    '',
+    '- `<command>`：<结果>',
+    '',
+    '未运行：',
+    '',
+    '- 无。或填写 `<command>`：原因：<原因>；残余风险：<风险>。',
+  ].join('\n');
+
+  const result = await runWorkflowScript('pr-guard.yml', {
+    github: prGuardGithub,
+    context: prGuardContext(verification),
+    env: prGuardEnv,
+  });
+
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /template placeholder text/u);
+});
+
+test('PR Guard accepts completed verification evidence', async () => {
+  const verification = [
+    '已运行：',
+    '',
+    '- `node --test .github/tests/*.test.cjs`：通过。',
+    '',
+    '未运行：',
+    '',
+    '- `actionlint`：原因：本地未安装；残余风险：Actions schema 由 CI 检查。',
+  ].join('\n');
+
+  const result = await runWorkflowScript('pr-guard.yml', {
+    github: prGuardGithub,
+    context: prGuardContext(verification),
+    env: prGuardEnv,
+  });
+
+  assert.deepEqual(result.failures, []);
+});
+
+test('PR Guard accepts trusted Dependabot pull requests without human template sections', async () => {
+  const context = prGuardContext('unused');
+  const pr = context.payload.pull_request;
+  pr.title = 'Bump actions/checkout from 6 to 7';
+  pr.body = 'Bumps actions/checkout from 6 to 7.';
+  pr.user.login = 'dependabot[bot]';
+  pr.head.repo = {
+    fork: false,
+    full_name: 'acme/widgets',
+    owner: { login: 'acme' },
+  };
+
+  const result = await runWorkflowScript('pr-guard.yml', {
+    github: prGuardGithub,
+    context,
+    env: { ...prGuardEnv, TRUSTED_AUTOMATION_USERS: 'dependabot[bot]' },
+  });
+
+  assert.deepEqual(result.failures, []);
+});
+
+test('Commitlint delegates generated messages from trusted automation', async () => {
+  const result = await runWorkflowScript('commitlint.yml', {
+    github: {},
+    context: {
+      repo: { owner: 'acme', repo: 'widgets' },
+      payload: { pull_request: { number: 42, user: { login: 'dependabot[bot]' } } },
+    },
+    env: { TRUSTED_AUTOMATION_USERS: 'dependabot[bot]' },
+  });
+
+  assert.deepEqual(result.failures, []);
 });

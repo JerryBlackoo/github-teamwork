@@ -11,10 +11,11 @@ permissions:
 jobs:
   claim:
     if: ${{ !github.event.issue.pull_request }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Handle task comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
@@ -182,10 +183,11 @@ jobs:
                   ? Date.parse(lastUnassigned.created_at || 0)
                   : Number.NEGATIVE_INFINITY;
                 const upperBound = Date.parse(assignment.created_at || 0);
-                const token = orderedClaimComments.find((candidate) => {
+                const tokens = orderedClaimComments.filter((candidate) => {
                   const createdAt = Date.parse(candidate.created_at || 0);
                   return candidate.claimLogin === login && createdAt > lowerBound && createdAt <= upperBound;
                 });
+                const token = tokens[tokens.length - 1];
                 assignment.claimTokenId = token ? String(token.id) : '';
               }
               const assigneeLogins = (latestIssue.assignees || []).map((assignee) => normalizeLogin(assignee.login));
@@ -404,15 +406,6 @@ jobs:
                 await createComment('实际工时更新失败：只有维护者、协作者或当前 Assignee 可以设置实际工时。');
                 return;
               }
-              const nextBody = replaceOrInsertField(body, '实际工时（小时数）', actualHours.text, ['预期工时（小时数）', '模块']);
-              let syncState = 'blocked';
-              let syncErrorMessage = '';
-              try {
-                syncState = await syncProject(issue, nextBody, 'hours', `@${comment.user.login} 通过 issue 评论更新实际工时。`);
-              } catch (error) {
-                syncErrorMessage = error.message;
-                core.warning(`Project actual-hours sync failed: ${error.message}`);
-              }
               const issueFieldsUpdated = await updateIssueFields([
                 {
                   label: '实际工时（小时数）',
@@ -422,6 +415,31 @@ jobs:
               ]);
               if (!issueFieldsUpdated) {
                 core.setFailed(`Actual-hours update for issue #${issueNumber} was aborted because the task contract changed.`);
+                return;
+              }
+              const committedIssue = await getIssue();
+              const committedHours = readFieldFromBody(committedIssue.body || '', '实际工时（小时数）');
+              if (!isManagedTask(committedIssue) || committedHours !== actualHours.text) {
+                core.setFailed(`Actual-hours update for issue #${issueNumber} did not remain committed.`);
+                return;
+              }
+              let syncState = 'blocked';
+              let syncErrorMessage = '';
+              try {
+                syncState = await syncProject(
+                  committedIssue,
+                  committedIssue.body || '',
+                  'hours',
+                  `@${comment.user.login} 通过 issue 评论更新实际工时。`
+                );
+              } catch (error) {
+                syncErrorMessage = error.message;
+                core.warning(`Project actual-hours sync failed: ${error.message}`);
+              }
+              const finalIssue = await getIssue();
+              const finalHours = readFieldFromBody(finalIssue.body || '', '实际工时（小时数）');
+              if (!isManagedTask(finalIssue) || finalHours !== actualHours.text) {
+                core.setFailed(`Actual-hours update for issue #${issueNumber} changed during Project sync.`);
                 return;
               }
               if (syncState === 'blocked') {
@@ -543,18 +561,6 @@ jobs:
               if (await rejectAfterAssignment(claimControl, canPromoteFrom(claimControl))) return;
             }
 
-            const claimIssue = claimControl.snapshot.issue;
-            const claimBody = claimIssue.body || '';
-            let nextBody = replaceOrInsertField(claimBody, '状态', 'In Progress', ['编号']);
-            nextBody = replaceOrInsertField(nextBody, 'Risk', 'Normal', ['模块']);
-            let syncState = 'blocked';
-            let syncErrorMessage = '';
-            try {
-              syncState = await syncProject(claimIssue, nextBody, 'claim', `@${commenterLogin} 通过 issue 评论认领本任务。`);
-            } catch (error) {
-              syncErrorMessage = error.message;
-              core.warning(`Project claim sync failed: ${error.message}`);
-            }
             let issueFieldsUpdated = false;
             for (let attempt = 0; attempt < 3 && !issueFieldsUpdated; attempt += 1) {
               const finalControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
@@ -587,6 +593,30 @@ jobs:
                 ...committedControl,
                 reason: committedControl.ok ? '任务状态未能保持为 `In Progress`。' : committedControl.reason,
               }, canPromoteFrom(committedControl));
+              return;
+            }
+            let syncState = 'blocked';
+            let syncErrorMessage = '';
+            try {
+              const committedIssue = committedControl.snapshot.issue;
+              syncState = await syncProject(
+                committedIssue,
+                committedIssue.body || '',
+                'claim',
+                `@${commenterLogin} 通过 issue 评论认领本任务。`
+              );
+            } catch (error) {
+              syncErrorMessage = error.message;
+              core.warning(`Project claim sync failed: ${error.message}`);
+            }
+            const syncedControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
+            rememberOwnAssignment(syncedControl);
+            const syncedStatus = readFieldFromBody(syncedControl.snapshot?.issue?.body || '', '状态');
+            if (!syncedControl.ok || syncedStatus !== 'In Progress') {
+              await rejectAfterAssignment({
+                ...syncedControl,
+                reason: syncedControl.ok ? '任务状态在 Project 同步期间发生变化。' : syncedControl.reason,
+              }, canPromoteFrom(syncedControl));
               return;
             }
             if (syncState === 'blocked') {
