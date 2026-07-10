@@ -404,7 +404,7 @@ jobs:
                 await createComment('实际工时更新失败：只有维护者、协作者或当前 Assignee 可以设置实际工时。');
                 return;
               }
-              let nextBody = replaceOrInsertField(body, '实际工时（小时数）', actualHours.text, ['预期工时（小时数）', '模块']);
+              const nextBody = replaceOrInsertField(body, '实际工时（小时数）', actualHours.text, ['预期工时（小时数）', '模块']);
               let syncState = 'blocked';
               let syncErrorMessage = '';
               try {
@@ -413,14 +413,12 @@ jobs:
                 syncErrorMessage = error.message;
                 core.warning(`Project actual-hours sync failed: ${error.message}`);
               }
-              nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
               const issueFieldsUpdated = await updateIssueFields([
                 {
                   label: '实际工时（小时数）',
                   value: actualHours.text,
                   anchors: ['预期工时（小时数）', '模块'],
                 },
-                { label: 'Project sync', value: syncState, anchors: ['GitHub Project'] },
               ]);
               if (!issueFieldsUpdated) {
                 core.setFailed(`Actual-hours update for issue #${issueNumber} was aborted because the task contract changed.`);
@@ -557,7 +555,6 @@ jobs:
               syncErrorMessage = error.message;
               core.warning(`Project claim sync failed: ${error.message}`);
             }
-            nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
             let issueFieldsUpdated = false;
             for (let attempt = 0; attempt < 3 && !issueFieldsUpdated; attempt += 1) {
               const finalControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
@@ -569,7 +566,6 @@ jobs:
               issueFieldsUpdated = await updateIssueFields([
                 { label: '状态', value: 'In Progress', anchors: ['编号'] },
                 { label: 'Risk', value: 'Normal', anchors: ['模块'] },
-                { label: 'Project sync', value: syncState, anchors: ['GitHub Project'] },
               ], (candidate) => {
                 const eligibility = validateClaimIssue(candidate);
                 const assignees = (candidate.assignees || []).map((assignee) => normalizeLogin(assignee.login));

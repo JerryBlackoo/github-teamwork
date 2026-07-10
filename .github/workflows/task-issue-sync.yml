@@ -122,16 +122,6 @@ jobs:
               }
               return { number, text: String(number) };
             };
-            const replaceOrInsertField = (issueBody, label, value, anchors = []) => {
-              const nextLine = `- ${label}：\`${value}\``;
-              const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：].*$`, 'imu');
-              if (pattern.test(issueBody)) return issueBody.replace(pattern, nextLine);
-              for (const anchor of anchors) {
-                const anchorPattern = new RegExp(`(^-\\s*${escapeRegExp(anchor)}\\s*[:：].*$)`, 'imu');
-                if (anchorPattern.test(issueBody)) return issueBody.replace(anchorPattern, (line) => `${line}\n${nextLine}`);
-              }
-              return `${issueBody.trimEnd()}\n${nextLine}\n`;
-            };
             const isManagedIssue = (issue) => {
               const issueBody = issue.body || '';
               return !issue.pull_request &&
@@ -184,7 +174,6 @@ jobs:
               });
               return {
                 issue,
-                body: issueBody,
                 fingerprint,
                 taskCode,
                 group,
@@ -282,26 +271,57 @@ jobs:
                 });
               }
             };
-            const writeSyncMarker = async (value, expectedFingerprint = '') => {
-              const markerIssue = await getIssue();
-              const markerSource = expectedFingerprint
-                ? buildSyncSource(markerIssue)
-                : (isManagedIssue(markerIssue) ? { body: markerIssue.body || '' } : null);
-              if (!markerSource) return false;
-              if (expectedFingerprint && markerSource.fingerprint !== expectedFingerprint) {
-                throw new SourceChangedError(markerSource);
+            const syncStatusMarker = '<!-- task-project-sync-status -->';
+            const syncRunUrl = `${context.serverUrl || 'https://github.com'}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const findSyncStatusComment = async () => {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              return comments.find((candidate) =>
+                candidate.user?.login === 'github-actions[bot]' &&
+                String(candidate.body || '').includes(syncStatusMarker)
+              );
+            };
+            const updateSyncStatusComment = async (body, createIfMissing) => {
+              const existing = await findSyncStatusComment();
+              if (existing) {
+                if (existing.body !== body) {
+                  await github.rest.issues.updateComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                    body,
+                  });
+                }
+                return;
               }
-              const nextBody = replaceOrInsertField(markerSource.body, 'Project sync', value, ['GitHub Project']);
-              if (nextBody !== markerSource.body) {
-                await github.rest.issues.update({
+              if (createIfMissing) {
+                await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: issueNumber,
-                  body: nextBody,
+                  body,
                 });
               }
-              if (expectedFingerprint) await assertSourceCurrent(expectedFingerprint);
-              return true;
+            };
+            const reportSyncBlocked = async (message) => {
+              await updateSyncStatusComment(
+                `${syncStatusMarker}\nProject sync **blocked**。\n\n- 错误：${message}\n- Workflow run：${syncRunUrl}`,
+                true
+              );
+            };
+            const reportSyncRecovered = async () => {
+              const existing = await findSyncStatusComment();
+              if (!existing || String(existing.body || '').includes('Project sync 已恢复')) return;
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `${syncStatusMarker}\nProject sync 已恢复。\n\n- Workflow run：${syncRunUrl}`,
+              });
             };
 
             let syncSucceeded = false;
@@ -345,8 +365,12 @@ jobs:
                 await assertSourceCurrent(source.fingerprint);
                 await syncLabels(source);
                 await assertSourceCurrent(source.fingerprint);
-                await writeSyncMarker('synced', source.fingerprint);
                 syncSucceeded = true;
+                try {
+                  await reportSyncRecovered();
+                } catch (error) {
+                  core.warning(`Could not update the Project sync recovery comment: ${error.message}`);
+                }
               } catch (error) {
                 if (error instanceof SourceChangedError) {
                   if (!error.source) {
@@ -365,6 +389,10 @@ jobs:
 
             if (!syncSucceeded) {
               if (!syncErrorMessage) syncErrorMessage = 'Task issue source did not stabilize after 3 attempts.';
-              await writeSyncMarker('blocked');
+              try {
+                await reportSyncBlocked(syncErrorMessage);
+              } catch (error) {
+                core.warning(`Could not publish the Project sync blocked comment: ${error.message}`);
+              }
               core.setFailed(`Task issue #${issueNumber} sync blocked. ${syncErrorMessage}`);
             }

@@ -337,10 +337,12 @@ const createSyncGithub = ({
   title = 'Team Project',
   fields = projectFields(),
   onFieldUpdate,
+  initialComments = [],
 }) => {
   const usesIssueSequence = Array.isArray(latestIssue);
   const issueVersions = usesIssueSequence ? latestIssue : [latestIssue];
   let currentIssue = clone(issueVersions[0]);
+  const comments = clone(initialComments);
   const calls = {
     get: [],
     graphql: [],
@@ -348,6 +350,8 @@ const createSyncGithub = ({
     fieldUpdates: [],
     addLabels: [],
     update: [],
+    createComment: [],
+    updateComment: [],
   };
   const listLabelsForRepo = async () => [
     { name: 'team:backend' },
@@ -364,10 +368,24 @@ const createSyncGithub = ({
           return { data: clone(issue) };
         },
         listLabelsForRepo,
+        async listComments() { return clone(comments); },
         async addLabels(args) { calls.addLabels.push(args); },
         async update(args) {
           calls.update.push(args);
           if (!usesIssueSequence) currentIssue.body = args.body;
+        },
+        async createComment(args) {
+          calls.createComment.push(args);
+          comments.push({
+            id: 8000 + comments.length,
+            body: args.body,
+            user: { login: 'github-actions[bot]' },
+          });
+        },
+        async updateComment(args) {
+          calls.updateComment.push(args);
+          const comment = comments.find((candidate) => candidate.id === args.comment_id);
+          if (comment) comment.body = args.body;
         },
       },
     },
@@ -407,11 +425,18 @@ const createSyncGithub = ({
       throw new Error(`Unexpected GraphQL operation: ${query}`);
     },
   };
-  return { github, calls };
+  return {
+    github,
+    calls,
+    readIssue: () => clone(currentIssue),
+    readComments: () => clone(comments),
+  };
 };
 
-const syncContext = (eventIssue) => ({
+const syncContext = (eventIssue, runId = 24680) => ({
   eventName: 'issues',
+  runId,
+  serverUrl: 'https://github.com',
   repo: { owner: 'acme', repo: 'widgets' },
   payload: { issue: eventIssue },
 });
@@ -521,6 +546,7 @@ test('two interleaved claim events are both processed and converge on one winner
   const loser = logins.find((login) => login !== winner);
   assert.equal(winner, 'zara', 'the server-ordered first assignment wins, not login sort order');
   assert.deepEqual(state.issue.assignees.map((assignee) => assignee.login), [winner]);
+  assert.match(state.issue.body, /- Project sync：`pending`/u);
   assert.equal(calls.get(winner).comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
   assert.equal(calls.get(loser).comments.filter((comment) => comment.body.includes('已认领本任务')).length, 0);
   assert.equal(calls.get(loser).comments.some((comment) => comment.body.includes('认领失败')), true);
@@ -777,6 +803,7 @@ test('actual hours only update a managed task and preserve the latest body', asy
     });
     assert.equal(calls.update.length, 1);
     assert.match(calls.update[0].body, /- 实际工时（小时数）：`2`/u);
+    assert.match(calls.update[0].body, /- Project sync：`pending`/u);
   });
 
   await t.test('body is refreshed again immediately before the update', async () => {
@@ -792,30 +819,36 @@ test('actual hours only update a managed task and preserve the latest body', asy
     assert.equal(calls.get.length, 2);
     assert.equal(calls.update.length, 1);
     assert.match(calls.update[0].body, /LATEST_WRITE_BASE/u);
+    assert.match(calls.update[0].body, /- Project sync：`pending`/u);
     assert.doesNotMatch(calls.update[0].body, /EVENT_ONLY/u);
     assert.doesNotMatch(calls.update[0].body, /FIRST_READ_ONLY/u);
   });
 });
 
-test('task sync refreshes the body again before writing Project sync', async () => {
-  const firstRead = taskIssue({ body: taskBody({ extra: 'FIRST_READ_ONLY' }) });
-  const writeBase = taskIssue({ body: taskBody({ extra: 'LATEST_WRITE_BASE' }) });
-  const fields = projectFields().filter((field) => field.name !== 'OwnerNote');
-  const { github, calls } = createSyncGithub({
-    latestIssue: [firstRead, writeBase],
-    fields,
+test('task sync never updates the issue body and preserves free text changed during the run', async () => {
+  assert.doesNotMatch(
+    readWorkflow('task-issue-sync.yml'),
+    /github\.rest\.issues\.update\s*\(/u,
+    'Task Issue Sync must not PATCH an Issue body from a background synchronization run'
+  );
+  const issue = taskIssue({ body: taskBody({ extra: 'ORIGINAL_FREE_TEXT' }) });
+  const concurrentIssue = taskIssue({ body: taskBody({ extra: 'CONCURRENT_FREE_TEXT' }) });
+  const { github, calls, readIssue } = createSyncGithub({
+    latestIssue: issue,
+    onFieldUpdate: async ({ count, setIssue }) => {
+      if (count === 1) setIssue(concurrentIssue);
+    },
   });
 
   await runWorkflowScript('task-issue-sync.yml', {
     github,
-    context: syncContext(firstRead),
+    context: syncContext(issue),
     env: syncEnv,
   });
 
-  assert.equal(calls.get.length, 2);
-  assert.equal(calls.update.length, 1);
-  assert.match(calls.update[0].body, /LATEST_WRITE_BASE/u);
-  assert.doesNotMatch(calls.update[0].body, /FIRST_READ_ONLY/u);
+  assert.equal(calls.update.length, 0);
+  assert.match(readIssue().body, /CONCURRENT_FREE_TEXT/u);
+  assert.doesNotMatch(readIssue().body, /ORIGINAL_FREE_TEXT/u);
 });
 
 test('task sync always refreshes the issue before deciding whether it is managed', async () => {
@@ -843,7 +876,7 @@ test('task sync retries a stale Project write and converges to the latest source
       '- 实际工时（小时数）：`5`'
     ),
   });
-  const { github, calls } = createSyncGithub({
+  const { github, calls, readIssue } = createSyncGithub({
     latestIssue: oldIssue,
     onFieldUpdate: async ({ count, setIssue }) => {
       if (count === 1) setIssue(newIssue);
@@ -861,8 +894,62 @@ test('task sync retries a stale Project write and converges to the latest source
   );
   assert.ok(calls.fieldUpdates.length > 10, 'the stale attempt must be followed by a full retry');
   assert.equal(actualHoursWrites.at(-1).value.number, 5);
-  assert.match(calls.update.at(-1).body, /- 实际工时（小时数）：`5`/u);
-  assert.match(calls.update.at(-1).body, /- Project sync：`synced`/u);
+  assert.equal(calls.update.length, 0);
+  assert.match(readIssue().body, /- 实际工时（小时数）：`5`/u);
+});
+
+test('task sync reports repeated failures through one idempotent bot comment', async () => {
+  const issue = taskIssue();
+  const { github, calls, readComments } = createSyncGithub({
+    latestIssue: issue,
+    title: 'Different Project',
+  });
+
+  const firstRun = await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue),
+    env: syncEnv,
+  });
+  const secondRun = await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue, 24681),
+    env: syncEnv,
+  });
+
+  assert.equal(firstRun.failures.length, 1);
+  assert.equal(secondRun.failures.length, 1);
+  assert.equal(calls.update.length, 0);
+  assert.equal(calls.createComment.length, 1);
+  assert.equal(calls.updateComment.length, 1);
+  assert.equal(readComments().length, 1);
+  assert.match(readComments()[0].body, /<!-- task-project-sync-status -->/u);
+  assert.match(readComments()[0].body, /blocked/iu);
+  assert.match(readComments()[0].body, /Different Project/u);
+  assert.match(readComments()[0].body, /https:\/\/github\.com\/acme\/widgets\/actions\/runs\/24681/u);
+});
+
+test('task sync marks an existing blocked bot comment as recovered after success', async () => {
+  const issue = taskIssue();
+  const { github, calls, readComments } = createSyncGithub({
+    latestIssue: issue,
+    initialComments: [{
+      id: 77,
+      body: '<!-- task-project-sync-status -->\nProject sync blocked.',
+      user: { login: 'github-actions[bot]' },
+    }],
+  });
+
+  await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(issue),
+    env: syncEnv,
+  });
+
+  assert.equal(calls.update.length, 0);
+  assert.equal(calls.createComment.length, 0);
+  assert.equal(calls.updateComment.length, 1);
+  assert.match(readComments()[0].body, /<!-- task-project-sync-status -->/u);
+  assert.match(readComments()[0].body, /恢复/u);
 });
 
 test('task sync validates Project identity and the complete schema before mutations', async (t) => {
@@ -945,8 +1032,9 @@ test('task sync mutates the Project after a complete valid schema passes', async
   assert.equal(calls.addLabels.length, 1);
   assert.equal(calls.projectMutations.filter((operation) => operation === 'add-item').length, 1);
   assert.equal(calls.projectMutations.filter((operation) => operation === 'update-field').length, 10);
-  assert.equal(calls.update.length, 1);
-  assert.match(calls.update[0].body, /- Project sync：`synced`/u);
+  assert.equal(calls.update.length, 0);
+  assert.equal(calls.createComment.length, 0);
+  assert.equal(calls.updateComment.length, 0);
 });
 
 test('a PR is blocked when any closing issue is blocked', async () => {
