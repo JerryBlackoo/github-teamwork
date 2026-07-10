@@ -151,17 +151,22 @@ jobs:
               const prIssue = await getIssue(pullNumber);
               const linkedIssueNumbers = await getClosingIssueNumbers(pullNumber);
               let shouldBeBlocked = false;
+              let lookupFailed = false;
               if (linkedIssueNumbers.length > 0) {
                 const states = [];
                 for (const issueNumber of linkedIssueNumbers) {
                   try {
                     states.push(issueIsBlocked(await getIssue(issueNumber)));
                   } catch (error) {
-                    core.warning(`Could not read linked issue #${issueNumber}; treating it as not blocked.`);
-                    states.push(false);
+                    lookupFailed = true;
+                    core.warning(`Could not read linked issue #${issueNumber}; preserving the PR's current blocked state.`);
                   }
                 }
-                shouldBeBlocked = states.every(Boolean);
+                if (lookupFailed) {
+                  core.warning(`Skipping blocked label sync for PR #${pullNumber} because a closing issue lookup failed.`);
+                  return;
+                }
+                shouldBeBlocked = states.some(Boolean);
               }
 
               if (shouldBeBlocked && !hasLabel(prIssue, blockedLabel)) {

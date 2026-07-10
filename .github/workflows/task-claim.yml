@@ -8,6 +8,10 @@ permissions:
   issues: write
   repository-projects: write
 
+concurrency:
+  group: task-issue-${{ github.repository_id }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   claim:
     if: ${{ !github.event.issue.pull_request }}
@@ -24,8 +28,7 @@ jobs:
         with:
           script: |
             const comment = context.payload.comment;
-            const issue = context.payload.issue;
-            const body = issue.body || '';
+            const issueNumber = context.payload.issue.number;
             const commentBody = (comment.body || '').trim();
             const claimMatch = commentBody.match(/^认领\s*[:：]\s*@?([A-Za-z0-9-]+)\s*$/u);
             const actualHoursMatch = commentBody.match(/^实际工时\s*[:：]\s*(.*?)\s*$/u);
@@ -49,10 +52,14 @@ jobs:
 
             const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const cleanValue = (value) => String(value || '').trim().replace(/^`|`$/g, '').replace(/`/g, '').trim();
-            const readField = (label) => {
+            const readFieldFromBody = (issueBody, label) => {
               const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：]\\s*(.+)$`, 'imu');
-              const match = body.match(pattern);
+              const match = issueBody.match(pattern);
               return match ? cleanValue(match[1]) : '';
+            };
+            const parseTaskCode = (title) => {
+              const match = title.trim().match(/^\[([PBFDSQ]-\d{3})\]\s+.+$/u);
+              return match ? match[1] : '';
             };
             const parseHourNumber = (value, label, allowZero = true) => {
               const normalized = cleanValue(value);
@@ -71,32 +78,51 @@ jobs:
               }
               return `${issueBody.trimEnd()}\n${nextLine}\n`;
             };
+            const issueResponse = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+            const issue = issueResponse.data;
+            const body = issue.body || '';
+            const taskCode = parseTaskCode(issue.title || '');
+            const configuredProject = readFieldFromBody(body, 'GitHub Project');
             const createComment = async (message) => {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: issue.number,
+                issue_number: issueNumber,
                 body: message,
               });
             };
-            const updateIssueBody = async (nextBody) => {
-              if (nextBody !== body) {
+            const updateIssueFields = async (updates) => {
+              const latestResponse = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+              const latestIssue = latestResponse.data;
+              const latestBody = latestIssue.body || '';
+              if (
+                !parseTaskCode(latestIssue.title || '') ||
+                readFieldFromBody(latestBody, 'GitHub Project') !== projectName
+              ) {
+                core.warning(`Issue #${issueNumber} stopped matching the managed-task contract before its body update.`);
+                return false;
+              }
+              let nextBody = latestBody;
+              for (const update of updates) {
+                nextBody = replaceOrInsertField(nextBody, update.label, update.value, update.anchors);
+              }
+              if (nextBody !== latestBody) {
                 await github.rest.issues.update({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: issue.number,
+                  issue_number: issueNumber,
                   body: nextBody,
                 });
               }
-            };
-            const parseTaskCode = (title) => {
-              const match = title.trim().match(/^\[([PBFDSQ]-\d{3})\]\s+.+$/u);
-              return match ? match[1] : '';
-            };
-            const readFieldFromBody = (issueBody, label) => {
-              const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：]\\s*(.+)$`, 'imu');
-              const match = issueBody.match(pattern);
-              return match ? cleanValue(match[1]) : '';
+              return true;
             };
             const projectGraphql = async (query, variables = {}) => {
               if (!process.env.PROJECTS_TOKEN) {
@@ -120,7 +146,7 @@ jobs:
             };
             const syncProject = async (issueBody, mode, note) => {
               const taskCode = parseTaskCode(issue.title || '');
-              if (!taskCode || !issueBody.includes('GitHub Project') || !issueBody.includes(projectName)) {
+              if (!taskCode || readFieldFromBody(issueBody, 'GitHub Project') !== projectName) {
                 core.info('Issue does not look like a managed task issue; skipping Project sync.');
                 return 'pending';
               }
@@ -149,8 +175,8 @@ jobs:
                 ? 'Done'
                 : ({ Draft: 'Todo', Ready: 'Todo', Blocked: 'In Progress', 'In Progress': 'In Progress', Review: 'In Progress', Done: 'Done' }[issueStatus] || 'Todo');
               const projectSelection = projectOwnerType === 'organization'
-                ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`
-                : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`;
+                ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`
+                : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`;
               const projectQuery = `query($login: String!, $number: Int!) { ${projectSelection} }`;
               const itemQuery = `query($issueId: ID!) { node(id: $issueId) { ... on Issue { projectItems(first: 50) { nodes { id project { id title } } } } } }`;
               const addItemMutation = `mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) { item { id } } }`;
@@ -159,44 +185,71 @@ jobs:
               const ownerNode = projectOwnerType === 'organization' ? projectResult.organization : projectResult.user;
               const project = ownerNode?.projectV2;
               if (!project) throw new Error(`Project '${projectName}' was not found for ${projectOwner}.`);
+              if (project.title !== projectName) {
+                throw new Error(`Project number ${projectNumber} resolved to '${project.title}', expected '${projectName}'.`);
+              }
               const fieldByName = new Map(project.fields.nodes.filter(Boolean).map((field) => [field.name, field]));
+              const requireField = (fieldName, dataType) => {
+                const field = fieldByName.get(fieldName);
+                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
+                if (field.dataType !== dataType) {
+                  throw new Error(`Project field '${fieldName}' must be ${dataType}, found ${field.dataType || 'unknown'}.`);
+                }
+                return field;
+              };
+              const singleSelectUpdate = (fieldName, optionName) => {
+                const field = requireField(fieldName, 'SINGLE_SELECT');
+                const option = field.options?.find((candidate) => candidate.name === optionName);
+                if (!option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
+                return { fieldId: field.id, value: { singleSelectOptionId: option.id } };
+              };
+              const textUpdate = (fieldName, text) => {
+                const field = requireField(fieldName, 'TEXT');
+                return { fieldId: field.id, value: { text } };
+              };
+              const numberUpdate = (fieldName, hours) => {
+                const field = requireField(fieldName, 'NUMBER');
+                return { fieldId: field.id, value: { number: hours.number } };
+              };
+              const updatePlan = [];
+              if (mode === 'claim') {
+                updatePlan.push(
+                  singleSelectUpdate('Status', projectStatus),
+                  singleSelectUpdate('Group', group),
+                  singleSelectUpdate('Priority', priority),
+                  singleSelectUpdate('Batch', batch),
+                  singleSelectUpdate('Module', moduleName),
+                  singleSelectUpdate('Risk', risk),
+                  textUpdate('Dependency', dependency)
+                );
+              }
+              updatePlan.push(
+                numberUpdate('ExpectedHours', expectedHours),
+                numberUpdate('ActualHours', actualHours),
+                textUpdate('OwnerNote', note)
+              );
+
               const itemResult = await projectGraphql(itemQuery, { issueId: issue.node_id });
               let item = itemResult.node.projectItems.nodes.find((node) => node.project.id === project.id);
               if (!item) {
                 const added = await projectGraphql(addItemMutation, { projectId: project.id, contentId: issue.node_id });
                 item = added.addProjectV2ItemById.item;
               }
-              const updateSingleSelect = async (fieldName, optionName) => {
-                const field = fieldByName.get(fieldName);
-                const option = field?.options?.find((candidate) => candidate.name === optionName);
-                if (!field || !option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { singleSelectOptionId: option.id } });
-              };
-              const updateText = async (fieldName, text) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { text } });
-              };
-              const updateNumber = async (fieldName, hours) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                const value = field.dataType === 'NUMBER' ? { number: hours.number } : { text: hours.text };
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value });
-              };
-              if (mode === 'claim') {
-                await updateSingleSelect('Status', projectStatus);
-                await updateSingleSelect('Group', group);
-                await updateSingleSelect('Priority', priority);
-                await updateSingleSelect('Batch', batch);
-                await updateSingleSelect('Module', moduleName);
-                await updateSingleSelect('Risk', risk);
-                await updateText('Dependency', dependency);
+              for (const update of updatePlan) {
+                await projectGraphql(updateFieldMutation, {
+                  projectId: project.id,
+                  itemId: item.id,
+                  fieldId: update.fieldId,
+                  value: update.value,
+                });
               }
-              await updateNumber('ExpectedHours', expectedHours);
-              await updateNumber('ActualHours', actualHours);
-              await updateText('OwnerNote', note);
               return 'synced';
             };
+
+            if (!taskCode || configuredProject !== projectName) {
+              core.info(`Issue #${issueNumber} is not a managed task for Project '${projectName}'; skipping task command.`);
+              return;
+            }
 
             if (actualHoursMatch) {
               let actualHours;
@@ -223,7 +276,14 @@ jobs:
                 core.warning(`Project actual-hours sync failed: ${error.message}`);
               }
               nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
-              await updateIssueBody(nextBody);
+              await updateIssueFields([
+                {
+                  label: '实际工时（小时数）',
+                  value: actualHours.text,
+                  anchors: ['预期工时（小时数）', '模块'],
+                },
+                { label: 'Project sync', value: syncState, anchors: ['GitHub Project'] },
+              ]);
               if (syncState === 'blocked') {
                 core.setFailed(`Updated actual hours on issue #${issue.number}, but Project sync is blocked. ${syncErrorMessage}`);
               } else {
@@ -238,7 +298,11 @@ jobs:
               await createComment(`认领失败：请使用自己的 GitHub 用户名认领，例如 \`认领：@${commenterLogin}\`。`);
               return;
             }
-            const taskStatus = readField('状态') || 'Draft';
+            if (issue.state !== 'open') {
+              await createComment('认领失败：只能认领 open 状态的任务。');
+              return;
+            }
+            const taskStatus = readFieldFromBody(body, '状态') || 'Draft';
             if (['Blocked', 'Review', 'Done'].includes(taskStatus)) {
               await createComment(`认领失败：当前任务状态为 \`${taskStatus}\`，请先由协调人改为 \`Draft\` 或 \`Ready\` 后再认领。`);
               return;
@@ -249,7 +313,11 @@ jobs:
               return;
             }
             try {
-              parseHourNumber(readField('预期工时（小时数）') || readField('预期工时'), '预期工时（小时数）', false);
+              parseHourNumber(
+                readFieldFromBody(body, '预期工时（小时数）') || readFieldFromBody(body, '预期工时'),
+                '预期工时（小时数）',
+                false
+              );
             } catch {
               await createComment('认领失败：请先把 `预期工时（小时数）` 填为大于 0 的小时数，例如 `0.5`、`1` 或 `2`。');
               return;
@@ -273,7 +341,11 @@ jobs:
               core.warning(`Project claim sync failed: ${error.message}`);
             }
             nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
-            await updateIssueBody(nextBody);
+            await updateIssueFields([
+              { label: '状态', value: 'In Progress', anchors: ['编号'] },
+              { label: 'Risk', value: 'Normal', anchors: ['模块'] },
+              { label: 'Project sync', value: syncState, anchors: ['GitHub Project'] },
+            ]);
             if (syncState === 'blocked') {
               core.setFailed(`Assigned issue #${issue.number} to @${commenterLogin}, but Project sync is blocked. ${syncErrorMessage}`);
             } else {
