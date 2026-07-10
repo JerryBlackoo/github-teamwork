@@ -18,10 +18,11 @@ permissions:
 jobs:
   sync:
     if: ${{ github.event_name == 'workflow_dispatch' || !github.event.issue.pull_request }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Sync task issue metadata
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
@@ -61,6 +62,7 @@ jobs:
               infra: 'area:devops',
               testing: 'area:testing',
             };
+            const trustedAuthorAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
             const projectGraphql = async (query, variables = {}) => {
               if (!process.env.PROJECTS_TOKEN) {
@@ -84,36 +86,29 @@ jobs:
             };
 
             const dispatchIssueNumber = Number(process.env.TASK_ISSUE_NUMBER || '0');
-            let issue = context.payload.issue;
-            if (!issue && dispatchIssueNumber > 0) {
+            const issueNumber = dispatchIssueNumber > 0
+              ? dispatchIssueNumber
+              : Number(context.payload.issue?.number || '0');
+            if (issueNumber <= 0) throw new Error('Task Issue Sync needs an issue event or workflow_dispatch issue_number.');
+            const getIssue = async () => {
               const response = await github.rest.issues.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: dispatchIssueNumber,
+                issue_number: issueNumber,
               });
-              issue = response.data;
-            }
-            if (!issue) throw new Error('Task Issue Sync needs an issue event or workflow_dispatch issue_number.');
-
-            const body = issue.body || '';
+              return response.data;
+            };
             const parseTaskCode = (title) => {
               const match = title.trim().match(/^\[([PBFDSQ]-\d{3})\]\s+.+$/u);
               return match ? match[1] : '';
             };
-            const taskCode = parseTaskCode(issue.title || '');
-            if (!taskCode || !body.includes(`GitHub Project`) || !body.includes(projectName)) {
-              core.info('Issue does not look like a managed task issue; skipping.');
-              return;
-            }
-
             const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const cleanValue = (value) => String(value || '').trim().replace(/^`|`$/g, '').replace(/`/g, '').trim();
-            const readField = (label) => {
+            const readFieldFromBody = (issueBody, label) => {
               const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：]\\s*(.+)$`, 'imu');
-              const match = body.match(pattern);
+              const match = issueBody.match(pattern);
               return match ? cleanValue(match[1]) : '';
             };
-            const readHourField = (baseLabel) => readField(`${baseLabel}（小时数）`) || readField(baseLabel);
             const parseHourNumber = (value, label, allowZero) => {
               const normalized = cleanValue(value || '');
               if (!normalized || normalized === '待估' || normalized === '未填写') {
@@ -129,122 +124,235 @@ jobs:
               }
               return { number, text: String(number) };
             };
-            const replaceOrInsertField = (issueBody, label, value, anchors = []) => {
-              const nextLine = `- ${label}：\`${value}\``;
-              const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：].*$`, 'imu');
-              if (pattern.test(issueBody)) return issueBody.replace(pattern, nextLine);
-              for (const anchor of anchors) {
-                const anchorPattern = new RegExp(`(^-\\s*${escapeRegExp(anchor)}\\s*[:：].*$)`, 'imu');
-                if (anchorPattern.test(issueBody)) return issueBody.replace(anchorPattern, (line) => `${line}\n${nextLine}`);
-              }
-              return `${issueBody.trimEnd()}\n${nextLine}\n`;
+            const isManagedIssue = (issue) => {
+              const issueBody = issue.body || '';
+              return !issue.pull_request &&
+                trustedAuthorAssociations.has(issue.author_association) &&
+                Boolean(parseTaskCode(issue.title || '')) &&
+                readFieldFromBody(issueBody, 'GitHub Project') === projectName;
+            };
+            const buildSyncSource = (issue) => {
+              if (!isManagedIssue(issue)) return null;
+              const issueBody = issue.body || '';
+              const readField = (label) => readFieldFromBody(issueBody, label);
+              const readHourField = (baseLabel) => readField(`${baseLabel}（小时数）`) || readField(baseLabel);
+              const taskCode = parseTaskCode(issue.title || '');
+              const prefix = taskCode[0];
+              const group = groupByPrefix[prefix];
+              const issueStatus = readField('状态') || 'Draft';
+              const priority = readField('优先级') || 'P1';
+              const batch = readField('批次') || 'Batch 0';
+              const modules = (readField('模块') || 'docs')
+                .split(/\s*(?:\/|／|,|，|、|\+|&)\s*/u)
+                .map(cleanValue)
+                .filter(Boolean);
+              const moduleName = modules[0] || 'docs';
+              const risk = issueStatus === 'Blocked'
+                ? 'Blocked'
+                : (issueStatus === 'Draft' ? (readField('Risk') || 'Needs Decision') : (readField('Risk') || 'Normal'));
+              const dependency = readField('依赖任务') || '无';
+              const projectStatus = issue.state === 'closed'
+                ? 'Done'
+                : ({ Draft: 'Todo', Ready: 'Todo', Blocked: 'In Progress', 'In Progress': 'In Progress', Review: 'In Progress', Done: 'Done' }[issueStatus] || 'Todo');
+              const expectedHours = parseHourNumber(
+                readHourField('预期工时'),
+                '预期工时（小时数）',
+                issueStatus === 'Draft'
+              );
+              const actualHours = parseHourNumber(readHourField('实际工时'), '实际工时（小时数）', true);
+              const fingerprint = JSON.stringify({
+                title: String(issue.title || '').trim(),
+                state: issue.state,
+                taskCode,
+                project: readField('GitHub Project'),
+                issueStatus,
+                group,
+                priority,
+                batch,
+                modules,
+                risk,
+                dependency,
+                expectedHours: expectedHours.number,
+                actualHours: actualHours.number,
+              });
+              return {
+                issue,
+                fingerprint,
+                taskCode,
+                group,
+                issueStatus,
+                priority,
+                batch,
+                modules,
+                moduleName,
+                risk,
+                dependency,
+                projectStatus,
+                expectedHours,
+                actualHours,
+              };
             };
 
-            const prefix = taskCode[0];
-            const group = groupByPrefix[prefix];
-            const issueStatus = readField('状态') || 'Draft';
-            const priority = readField('优先级') || 'P1';
-            const batch = readField('批次') || 'Batch 0';
-            const modules = (readField('模块') || 'docs')
-              .split(/\s*(?:\/|／|,|，|、|\+|&)\s*/u)
-              .map(cleanValue)
-              .filter(Boolean);
-            const moduleName = modules[0] || 'docs';
-            const risk = issueStatus === 'Blocked' ? 'Blocked' : (issueStatus === 'Draft' ? (readField('Risk') || 'Needs Decision') : (readField('Risk') || 'Normal'));
-            const dependency = readField('依赖任务') || '无';
-            const projectStatus = issue.state === 'closed'
-              ? 'Done'
-              : ({ Draft: 'Todo', Ready: 'Todo', Blocked: 'In Progress', 'In Progress': 'In Progress', Review: 'In Progress', Done: 'Done' }[issueStatus] || 'Todo');
-            const allowZeroExpected = issueStatus === 'Draft';
-            const expectedHours = parseHourNumber(readHourField('预期工时'), '预期工时（小时数）', allowZeroExpected);
-            const actualHours = parseHourNumber(readHourField('实际工时'), '实际工时（小时数）', true);
-
-            const labelsToAdd = new Set([groupLabelByGroup[group]].filter(Boolean));
-            for (const module of modules) {
-              if (moduleLabelByModule[module]) labelsToAdd.add(moduleLabelByModule[module]);
+            class SourceChangedError extends Error {
+              constructor(source) {
+                super('Task issue source changed during Project sync.');
+                this.source = source;
+              }
             }
-            const existingLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100,
-            });
-            const existingLabelNames = new Set(existingLabels.map((label) => label.name));
-            const validLabels = [...labelsToAdd].filter((label) => existingLabelNames.has(label));
-            if (validLabels.length > 0) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                labels: validLabels,
-              });
-            }
+            const readCurrentSource = async () => buildSyncSource(await getIssue());
+            const assertSourceCurrent = async (expectedFingerprint) => {
+              const currentSource = await readCurrentSource();
+              if (!currentSource || currentSource.fingerprint !== expectedFingerprint) {
+                throw new SourceChangedError(currentSource);
+              }
+              return currentSource;
+            };
 
             const projectSelection = projectOwnerType === 'organization'
-              ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`
-              : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`;
+              ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`
+              : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`;
             const projectQuery = `query($login: String!, $number: Int!) { ${projectSelection} }`;
             const itemQuery = `query($issueId: ID!) { node(id: $issueId) { ... on Issue { projectItems(first: 50) { nodes { id project { id title } } } } } }`;
             const addItemMutation = `mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) { item { id } } }`;
             const updateFieldMutation = `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2FieldValue!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: $value }) { projectV2Item { id } } }`;
 
-            let syncState = 'blocked';
-            let syncErrorMessage = '';
-            try {
-              const projectResult = await projectGraphql(projectQuery, { login: projectOwner, number: projectNumber });
-              const ownerNode = projectOwnerType === 'organization' ? projectResult.organization : projectResult.user;
-              const project = ownerNode?.projectV2;
-              if (!project) throw new Error(`Project '${projectName}' was not found for ${projectOwner}.`);
-
+            const buildUpdatePlan = (project, source) => {
               const fieldByName = new Map(project.fields.nodes.filter(Boolean).map((field) => [field.name, field]));
-              const itemResult = await projectGraphql(itemQuery, { issueId: issue.node_id });
-              let item = itemResult.node.projectItems.nodes.find((node) => node.project.id === project.id);
-              if (!item) {
-                const added = await projectGraphql(addItemMutation, { projectId: project.id, contentId: issue.node_id });
-                item = added.addProjectV2ItemById.item;
+              const requireField = (fieldName, dataType) => {
+                const field = fieldByName.get(fieldName);
+                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
+                if (field.dataType !== dataType) {
+                  throw new Error(`Project field '${fieldName}' must be ${dataType}, found ${field.dataType || 'unknown'}.`);
+                }
+                return field;
+              };
+              const singleSelectUpdate = (fieldName, optionName) => {
+                const field = requireField(fieldName, 'SINGLE_SELECT');
+                const option = field.options?.find((candidate) => candidate.name === optionName);
+                if (!option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
+                return { fieldId: field.id, value: { singleSelectOptionId: option.id } };
+              };
+              const textUpdate = (fieldName, text) => {
+                const field = requireField(fieldName, 'TEXT');
+                return { fieldId: field.id, value: { text } };
+              };
+              const numberUpdate = (fieldName, hours) => {
+                const field = requireField(fieldName, 'NUMBER');
+                return { fieldId: field.id, value: { number: hours.number } };
+              };
+              return [
+                singleSelectUpdate('Status', source.projectStatus),
+                singleSelectUpdate('Group', source.group),
+                singleSelectUpdate('Priority', source.priority),
+                singleSelectUpdate('Batch', source.batch),
+                singleSelectUpdate('Module', source.moduleName),
+                singleSelectUpdate('Risk', source.risk),
+                textUpdate('Dependency', source.dependency),
+                numberUpdate('ExpectedHours', source.expectedHours),
+                numberUpdate('ActualHours', source.actualHours),
+                textUpdate('OwnerNote', `自动同步自 issue #${source.issue.number}；任务编号 ${source.taskCode}。`),
+              ];
+            };
+            const syncLabels = async (source) => {
+              const labelsToAdd = new Set([groupLabelByGroup[source.group]].filter(Boolean));
+              for (const module of source.modules) {
+                if (moduleLabelByModule[module]) labelsToAdd.add(moduleLabelByModule[module]);
               }
-              const updateSingleSelect = async (fieldName, optionName) => {
-                const field = fieldByName.get(fieldName);
-                const option = field?.options?.find((candidate) => candidate.name === optionName);
-                if (!field || !option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { singleSelectOptionId: option.id } });
-              };
-              const updateText = async (fieldName, text) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { text } });
-              };
-              const updateNumber = async (fieldName, hours) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                const value = field.dataType === 'NUMBER' ? { number: hours.number } : { text: hours.text };
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value });
-              };
-
-              await updateSingleSelect('Status', projectStatus);
-              await updateSingleSelect('Group', group);
-              await updateSingleSelect('Priority', priority);
-              await updateSingleSelect('Batch', batch);
-              await updateSingleSelect('Module', moduleName);
-              await updateSingleSelect('Risk', risk);
-              await updateText('Dependency', dependency);
-              await updateNumber('ExpectedHours', expectedHours);
-              await updateNumber('ActualHours', actualHours);
-              await updateText('OwnerNote', `自动同步自 issue #${issue.number}；任务编号 ${taskCode}。`);
-              syncState = 'synced';
-            } catch (error) {
-              syncErrorMessage = error.message;
-              core.warning(`Task issue sync failed: ${error.message}`);
-            }
-
-            let nextBody = replaceOrInsertField(body, 'Project sync', syncState, ['GitHub Project']);
-            if (nextBody !== body) {
-              await github.rest.issues.update({
+              const existingLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: issue.number,
-                body: nextBody,
+                per_page: 100,
               });
+              const existingLabelNames = new Set(existingLabels.map((label) => label.name));
+              const currentIssueLabels = new Set((source.issue.labels || []).map((label) => (
+                typeof label === 'string' ? label : label.name
+              )));
+              const managedLabels = new Set([
+                ...Object.values(groupLabelByGroup),
+                ...Object.values(moduleLabelByModule),
+              ]);
+              const validLabels = [...labelsToAdd].filter((label) => existingLabelNames.has(label));
+              if (validLabels.length > 0) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  labels: validLabels,
+                });
+              }
+              for (const label of currentIssueLabels) {
+                if (!managedLabels.has(label) || labelsToAdd.has(label)) continue;
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    name: label,
+                  });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+            };
+            let syncSucceeded = false;
+            let syncErrorMessage = '';
+            for (let attempt = 0; attempt < 3 && !syncSucceeded; attempt += 1) {
+              try {
+                const source = await readCurrentSource();
+                if (!source) {
+                  core.info('Issue does not look like a managed task issue; skipping.');
+                  return;
+                }
+                const projectResult = await projectGraphql(projectQuery, { login: projectOwner, number: projectNumber });
+                const ownerNode = projectOwnerType === 'organization' ? projectResult.organization : projectResult.user;
+                const project = ownerNode?.projectV2;
+                if (!project) throw new Error(`Project '${projectName}' was not found for ${projectOwner}.`);
+                if (project.title !== projectName) {
+                  throw new Error(`Project number ${projectNumber} resolved to '${project.title}', expected '${projectName}'.`);
+                }
+                const updatePlan = buildUpdatePlan(project, source);
+                const itemResult = await projectGraphql(itemQuery, { issueId: source.issue.node_id });
+                let item = itemResult.node.projectItems.nodes.find((node) => node.project.id === project.id);
+                if (!item) {
+                  await assertSourceCurrent(source.fingerprint);
+                  const added = await projectGraphql(addItemMutation, {
+                    projectId: project.id,
+                    contentId: source.issue.node_id,
+                  });
+                  await assertSourceCurrent(source.fingerprint);
+                  item = added.addProjectV2ItemById.item;
+                }
+                for (const update of updatePlan) {
+                  await assertSourceCurrent(source.fingerprint);
+                  await projectGraphql(updateFieldMutation, {
+                    projectId: project.id,
+                    itemId: item.id,
+                    fieldId: update.fieldId,
+                    value: update.value,
+                  });
+                  await assertSourceCurrent(source.fingerprint);
+                }
+                await assertSourceCurrent(source.fingerprint);
+                await syncLabels(source);
+                await assertSourceCurrent(source.fingerprint);
+                syncSucceeded = true;
+              } catch (error) {
+                if (error instanceof SourceChangedError) {
+                  if (!error.source) {
+                    core.warning(`Issue #${issueNumber} stopped matching the managed-task contract during sync.`);
+                    return;
+                  }
+                  syncErrorMessage = error.message;
+                  core.warning(`Task issue source changed; retrying Project sync (${attempt + 1}/3).`);
+                  continue;
+                }
+                syncErrorMessage = error.message;
+                core.warning(`Task issue sync failed: ${error.message}`);
+                break;
+              }
             }
-            if (syncState === 'blocked') {
-              core.setFailed(`Task issue #${issue.number} sync blocked. ${syncErrorMessage}`);
+
+            if (!syncSucceeded) {
+              if (!syncErrorMessage) syncErrorMessage = 'Task issue source did not stabilize after 3 attempts.';
+              core.setFailed(`Task issue #${issueNumber} sync blocked. ${syncErrorMessage}`);
             }

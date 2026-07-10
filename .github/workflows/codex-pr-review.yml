@@ -5,27 +5,33 @@ on:
     branches: [develop]
     types: [opened, synchronize, reopened, ready_for_review]
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
+permissions: {}
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
     name: Review pull request
-    if: ${{ github.event.pull_request.draft == false }}
-    runs-on: ubuntu-22.04
+    if: ${{ github.event.pull_request.draft == false && vars.CODEX_REVIEW_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
 
     steps:
       - name: Check out base branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 
       - name: Build PR review context
-        id: pr_context
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CONTEXT_PATH: .github/codex/pr-context.md
           PR_HEAD_PATH: .github/codex/pr-head
@@ -34,12 +40,15 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             const pr = context.payload.pull_request;
+            if (!pr.head.repo) throw new Error('PR head repository is unavailable.');
+
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: pr.number,
               per_page: 100,
             });
+            if (files.length > 500) throw new Error(`PR changes ${files.length} files; review limit is 500.`);
             const commits = await github.paginate(github.rest.pulls.listCommits, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -50,6 +59,9 @@ jobs:
             const prHeadRoot = path.resolve(process.env.PR_HEAD_PATH);
             const [headOwner, headRepo] = pr.head.repo.full_name.split('/');
             const materializedHeadFiles = new Set();
+            const maxFileBytes = 1_000_000;
+            const maxTotalBytes = 20_000_000;
+            let materializedBytes = 0;
             fs.mkdirSync(prHeadRoot, { recursive: true });
 
             const safeHeadFilePath = (filename) => {
@@ -63,10 +75,16 @@ jobs:
             for (const file of files) {
               if (file.status === 'removed') continue;
               try {
-                const targetPath = safeHeadFilePath(file.filename);
                 const blob = await github.rest.git.getBlob({ owner: headOwner, repo: headRepo, file_sha: file.sha });
+                const size = Number(blob.data.size || 0);
+                if (size > maxFileBytes || materializedBytes + size > maxTotalBytes) {
+                  core.warning(`Skipping full content for ${file.filename}: materialization limit reached.`);
+                  continue;
+                }
+                const targetPath = safeHeadFilePath(file.filename);
                 fs.mkdirSync(path.dirname(targetPath), { recursive: true });
                 fs.writeFileSync(targetPath, Buffer.from(blob.data.content, blob.data.encoding === 'base64' ? 'base64' : 'utf8'));
+                materializedBytes += size;
                 materializedHeadFiles.add(file.filename);
               } catch (error) {
                 core.warning(`Could not materialize ${file.filename}: ${error.message}`);
@@ -82,7 +100,7 @@ jobs:
             append(`Title: ${pr.title}`);
             append(`Author: ${pr.user?.login || 'unknown'}`);
             append(`Base: ${pr.base.ref} (${pr.base.sha})`);
-            append(`Head: ${pr.head.repo?.full_name || 'unknown'}:${pr.head.ref} (${pr.head.sha})`);
+            append(`Head: ${pr.head.repo.full_name}:${pr.head.ref} (${pr.head.sha})`);
             append();
             append('## Pull Request Body');
             append();
@@ -125,45 +143,49 @@ jobs:
             }
             fs.mkdirSync(path.dirname(process.env.CONTEXT_PATH), { recursive: true });
             fs.writeFileSync(process.env.CONTEXT_PATH, `${lines.join('\n')}\n`, 'utf8');
-            core.setOutput('pull-request-number', String(pr.number));
 
       - name: Run Codex review
         id: codex
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           responses-api-endpoint: ${{ vars.OPENAI_RESPONSES_API_ENDPOINT }}
           prompt-file: .github/codex/prompts/review.md
-          output-file: .github/codex/review-output.md
-          allow-users: "*"
-          sandbox: workspace-write
+          permission-profile: ":read-only"
 
+  publish:
+    name: Publish review comment
+    needs: review
+    if: ${{ needs.review.outputs.final_message != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
       - name: Publish PR review comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          REVIEW_PATH: .github/codex/review-output.md
+          REVIEW: ${{ needs.review.outputs.final_message }}
         with:
           script: |
-            const fs = require('fs');
-            const pullNumber = Number('${{ steps.pr_context.outputs.pull-request-number }}');
-            const review = fs.existsSync(process.env.REVIEW_PATH)
-              ? fs.readFileSync(process.env.REVIEW_PATH, 'utf8').trim()
-              : '';
-            const headSha = context.payload.pull_request?.head?.sha || 'unknown';
+            const review = String(process.env.REVIEW || '').trim();
+            if (!review) return;
+            const pr = context.payload.pull_request;
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
               '## Codex PR Review',
               '',
-              review || 'Codex did not return a review body.',
+              review,
               '',
               '---',
-              `Head: \`${headSha.slice(0, 12)}\` | [Workflow run](${runUrl})`,
+              `Head: \`${pr.head.sha.slice(0, 12)}\` | [Workflow run](${runUrl})`,
               '',
               '_Generated by GitHub Actions using openai/codex-action._',
             ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: pullNumber,
+              issue_number: pr.number,
               body,
             });

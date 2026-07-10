@@ -2,6 +2,12 @@
 
 本文面向仓库维护者，说明如何把这个模板接入一个新的 GitHub 项目。
 
+## 默认分支
+
+创建或复制仓库后先创建 `develop`，并把它设为 GitHub 默认分支。日常 PR 进入 `develop`，`main` 只用于稳定版本和发布。
+
+这项设置也决定 `Closes #123` 等 closing keyword 何时自动关闭 issue；只有合入默认分支的 PR 才会自动关闭关联 issue。
+
 ## 推荐 label
 
 ```text
@@ -55,7 +61,7 @@ Project 建议字段：
 | `Group` | Single select | `Product`, `Backend`, `Frontend`, `DevOps`, `QA`, `Special` |
 | `Priority` | Single select | `P0`, `P1`, `P2` |
 | `Batch` | Single select | `Batch 0`, `Batch 1`, `Batch 2`, `Batch 3` |
-| `Module` | Single select | 按项目模块设置，例如 `frontend`, `api`, `infra`, `docs` |
+| `Module` | Single select | 默认需包含 `frontend`, `backend`, `api`, `docs`, `ci`, `infra`, `testing`；修改模板时同步调整。 |
 | `Risk` | Single select | `Normal`, `Needs Decision`, `Blocked` |
 | `Dependency` | Text | 上游 issue 引用或说明。 |
 | `ExpectedHours` | Number | 预期工时。 |
@@ -68,7 +74,7 @@ Project 建议字段：
 
 | Secret | 用途 |
 | --- | --- |
-| `PROJECTS_TOKEN` | 可选。访问 user-level 或 organization Project v2 的 token。 |
+| `PROJECTS_TOKEN` | 启用 Project v2 同步时必需。访问 user-level 或 organization Project v2 的 token。 |
 | `OPENAI_API_KEY` | 可选。Codex PR Review 调用上游模型服务的 token。 |
 
 `PROJECTS_TOKEN` 应使用 fine-grained token 或 classic token，并授予目标 Project 读写权限。Issue 评论、label 和 assignee 仍由 GitHub 自动提供的 `GITHUB_TOKEN` 处理。
@@ -83,26 +89,39 @@ Project 建议字段：
 | `PROJECT_OWNER_TYPE` | `user` 或 `organization`。 |
 | `PROJECT_NUMBER` | Project 编号。 |
 | `PROJECT_NAME` | Project 标题，默认 `Team Project`。 |
+| `CODEX_REVIEW_ENABLED` | `true` 时启用 Codex PR Review；未设置时不运行。 |
 | `OPENAI_RESPONSES_API_ENDPOINT` | Codex review 的 Responses API endpoint。 |
 
 ## Codex PR Review
 
 Codex review 由 [.github/workflows/codex-pr-review.yml](../../.github/workflows/codex-pr-review.yml) 配置。
 
-必要配置：
+启用 Codex review 时的必要配置：
 
 ```text
 Secret:   OPENAI_API_KEY
-Variable: OPENAI_RESPONSES_API_ENDPOINT
+Variable: CODEX_REVIEW_ENABLED=true
 ```
 
-官方 OpenAI endpoint 通常是：
+`OPENAI_RESPONSES_API_ENDPOINT` 是可选覆盖项；留空时 action 使用默认 endpoint。官方 OpenAI endpoint 通常是：
 
 ```text
 https://api.openai.com/v1/responses
 ```
 
 如果使用自建网关，它必须兼容 OpenAI Responses API，并支持 `openai/codex-action@v1` 实际使用的请求和响应格式。只支持旧 `/v1/chat/completions` 通常不够。
+
+Codex action 默认只允许对仓库有 write 权限的用户触发，不要设置 `allow-users: "*"`。Review job 使用只读 permission profile，发布评论在独立 job 中完成。
+
+## CODEOWNERS 与安全报告
+
+把 [.github/CODEOWNERS](../../.github/CODEOWNERS) 中的 `@JerryBlackoo` 替换为新仓库的维护者或团队。启用 Require review from Code Owners 前，先确认所有路径都有可用 owner。
+
+在 `Settings -> Code security` 启用 Private vulnerability reporting，并按 [SECURITY.md](../../SECURITY.md) 检查团队的私密联系方式。安全入口不要硬编码到模板来源仓库。
+
+## Dependabot
+
+[.github/dependabot.yml](../../.github/dependabot.yml) 默认每周检查 GitHub Actions，并向 `develop` 发 PR。`dependabot[bot]` 是 PR Guard 和 Commitlint 唯一默认受信自动化账号；增加其他机器人时必须同时审查其权限、PR 来源和守门豁免范围。
 
 ## develop 分支保护
 
@@ -119,6 +138,7 @@ https://api.openai.com/v1/responses
 
 - `PR Guard`
 - `Commitlint`
+- `Docs Check`
 - 项目自己的 CI，例如 frontend/backend/test/deploy checks
 
 `Auto Label` 不建议作为 required check，它是辅助自动化。
@@ -135,6 +155,7 @@ https://api.openai.com/v1/responses
 ## Workflow 权限原则
 
 - 只读检查使用 `contents: read`。
+- PR Guard 和 Commitlint 使用只读 `pull_request` 事件，使 required check 绑定到待合并提交。
 - 打 label 或评论 PR 需要 `issues: write` 或 `pull-requests: write`。
 - 不依赖 GitHub 默认 token 权限。
 - 不给读文件的 workflow 添加写权限。

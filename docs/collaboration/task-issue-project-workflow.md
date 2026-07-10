@@ -48,7 +48,6 @@
 - 阻塞任务。
 - 并行任务。
 - GitHub Project。
-- Project sync。
 - 权威依据。
 - 任务范围。
 - 交付物。
@@ -66,7 +65,6 @@
 - 预期工时（小时数）：`1`
 - 实际工时（小时数）：`0`
 - GitHub Project：`Team Project`
-- Project sync：`pending`
 ```
 
 需要进一步确认：
@@ -89,7 +87,7 @@
 - 允许整数和小数，例如 `0`、`0.5`、`1.25`。
 - 非 `Draft` 任务的预期工时必须大于 `0`。
 - 实际工时初始可为 `0`。
-- 关闭任务时，自动化会尽量回填实际工时。
+- 关闭任务前应通过 issue 正文或评论命令确认实际工时；自动化不会用预期工时伪造实际工时。
 - 维护者、协作者或当前 assignee 可评论 `实际工时：2` 手动更新。
 
 ## 依赖规则
@@ -125,6 +123,7 @@
 
 识别条件：
 
+- Issue 作者是仓库 `OWNER`、`MEMBER` 或 `COLLABORATOR`；外部用户创建的相似 Issue 不会写入内部 Project。
 - 标题匹配 `[P-001] ...` 等标准编号。
 - 正文包含 `GitHub Project：Team Project`，或你配置的 Project 名称。
 - 正文包含可解析的任务字段。
@@ -139,15 +138,15 @@
 | 同步 Priority / Batch / Module / Risk | Issue 正文字段。 |
 | 同步 ExpectedHours / ActualHours | Issue 工时字段。 |
 | 同步 Dependency | Issue `依赖任务`。 |
-| 添加 label | 主责小组和模块。 |
-| 回写 Project sync | 同步结果。 |
+| 收敛 label | 添加当前主责小组和模块 label，并移除旧的受管小组/模块 label。 |
 
-如果 `Project sync` 变为 `blocked`，维护者检查：
+如果 `Task Issue Sync` workflow 失败，维护者检查：
 
 - Project 字段是否存在。
 - `PROJECTS_TOKEN` 是否能访问 Project。
 - Project name、owner、number 是否正确。
 - Issue 正文字段是否保留模板格式。
+- Workflow run 中报告的具体字段、权限或 API 错误。
 
 ## 认领
 

@@ -30,7 +30,6 @@ assignees: ''
 - 依赖原因：写清楚依赖的接口、schema、数据结构、环境变量、服务能力或验收条件。
 - 建议分支：`Team/type/short-title`
 - GitHub Project：`Team Project`
-- Project sync：`pending / synced / blocked`
 
 ## 发布前检查
 
