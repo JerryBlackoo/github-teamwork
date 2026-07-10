@@ -796,7 +796,7 @@ test('workflow regression tests are executed by CI with a pinned Node setup acti
   const docsCheck = readWorkflow('docs-check.yml');
   assert.match(
     docsCheck,
-    /actions\/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f/u
+    /actions\/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e/u
   );
   assert.match(docsCheck, /node-version:\s*['"]22\.19\.0['"]/u);
   assert.match(docsCheck, /node --test \.github\/tests\/\*\.test\.cjs/u);
