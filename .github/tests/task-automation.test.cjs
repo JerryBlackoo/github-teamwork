@@ -80,15 +80,23 @@ const taskIssue = (overrides = {}) => ({
   ...overrides,
 });
 
-const claimContext = (issue, body = '认领：@alice', login = 'alice') => ({
+const claimContext = (
+  issue,
+  body = '认领：@alice',
+  login = 'alice',
+  commentId = 1000,
+  createdAt = '2026-07-10T01:00:00Z'
+) => ({
   eventName: 'issue_comment',
   repo: { owner: 'acme', repo: 'widgets' },
   payload: {
     issue,
     comment: {
+      id: commentId,
       body,
       user: { login },
       author_association: 'MEMBER',
+      created_at: createdAt,
     },
   },
 });
@@ -177,17 +185,29 @@ const claimProjectFields = () => [
 const createClaimHarness = ({
   initialIssue = taskIssue(),
   logins = ['alice'],
+  runnerLogins = {},
   synchronizeClaims = false,
   synchronizeInitialReads = false,
   synchronizeAdds = false,
   beforeAdd,
   onAdd,
   onProjectUpdate,
+  initialEvents = [],
+  initialComments,
 } = {}) => {
   const state = {
     issue: clone(initialIssue),
-    events: [],
-    nextEventId: 100,
+    events: clone(initialEvents),
+    comments: clone(initialComments || logins.map((runnerKey, index) => {
+      const login = runnerLogins[runnerKey] || runnerKey;
+      return {
+        id: 1000 + index,
+        body: `认领：@${login}`,
+        user: { login },
+        created_at: `2026-07-10T01:00:${String(index).padStart(2, '0')}Z`,
+      };
+    })),
+    nextEventId: Math.max(99, ...initialEvents.map((event) => Number(event.id || 0))) + 1,
   };
   const calls = new Map(logins.map((login) => [login, {
     get: [],
@@ -204,15 +224,18 @@ const createClaimHarness = ({
     ? createBarrier(logins.length)
     : async () => {};
 
-  const githubFor = (runnerLogin) => {
-    const runnerCalls = calls.get(runnerLogin);
+  const githubFor = (runnerKey) => {
+    const runnerLogin = runnerLogins[runnerKey] || runnerKey;
+    const runnerCalls = calls.get(runnerKey);
     let firstGet = true;
     let projectUpdateCount = 0;
     const listEvents = async () => clone(state.events);
+    const listComments = async () => clone(state.comments);
     return {
       rest: {
         issues: {
           listEvents,
+          listComments,
           async get(args) {
             runnerCalls.get.push(args);
             if (firstGet) {
@@ -227,7 +250,7 @@ const createClaimHarness = ({
             runnerCalls.addAssignees.push(args);
             if (beforeAdd) await beforeAdd({ runnerLogin, state });
             if (synchronizeClaims) {
-              const assignmentIndex = logins.indexOf(runnerLogin);
+              const assignmentIndex = logins.indexOf(runnerKey);
               while (state.events.filter((event) => event.event === 'assigned').length < assignmentIndex) {
                 await new Promise((resolve) => setTimeout(resolve, 0));
               }
@@ -239,6 +262,7 @@ const createClaimHarness = ({
                   id: state.nextEventId++,
                   event: 'assigned',
                   assignee: { login },
+                  created_at: '2026-07-10T01:05:00Z',
                 });
               }
             }
@@ -253,6 +277,7 @@ const createClaimHarness = ({
                 id: state.nextEventId++,
                 event: 'unassigned',
                 assignee: { login },
+                created_at: '2026-07-10T01:10:00Z',
               });
             }
           },
@@ -261,7 +286,15 @@ const createClaimHarness = ({
             state.issue.body = args.body;
             return { data: clone(state.issue) };
           },
-          async createComment(args) { runnerCalls.comments.push(args); },
+          async createComment(args) {
+            runnerCalls.comments.push(args);
+            state.comments.push({
+              id: 9000 + state.comments.length,
+              body: args.body,
+              user: { login: 'github-actions[bot]' },
+              created_at: '2026-07-10T01:20:00Z',
+            });
+          },
         },
       },
       async paginate(fn, args) { return fn(args); },
@@ -299,12 +332,20 @@ const createClaimHarness = ({
   return { state, calls, githubFor };
 };
 
-const createSyncGithub = ({ latestIssue, title = 'Team Project', fields = projectFields() }) => {
-  const issueVersions = Array.isArray(latestIssue) ? latestIssue : [latestIssue];
+const createSyncGithub = ({
+  latestIssue,
+  title = 'Team Project',
+  fields = projectFields(),
+  onFieldUpdate,
+}) => {
+  const usesIssueSequence = Array.isArray(latestIssue);
+  const issueVersions = usesIssueSequence ? latestIssue : [latestIssue];
+  let currentIssue = clone(issueVersions[0]);
   const calls = {
     get: [],
     graphql: [],
     projectMutations: [],
+    fieldUpdates: [],
     addLabels: [],
     update: [],
   };
@@ -317,15 +358,21 @@ const createSyncGithub = ({ latestIssue, title = 'Team Project', fields = projec
       issues: {
         async get(args) {
           calls.get.push(args);
-          return { data: issueVersions[Math.min(calls.get.length - 1, issueVersions.length - 1)] };
+          const issue = usesIssueSequence
+            ? issueVersions[Math.min(calls.get.length - 1, issueVersions.length - 1)]
+            : currentIssue;
+          return { data: clone(issue) };
         },
         listLabelsForRepo,
         async addLabels(args) { calls.addLabels.push(args); },
-        async update(args) { calls.update.push(args); },
+        async update(args) {
+          calls.update.push(args);
+          if (!usesIssueSequence) currentIssue.body = args.body;
+        },
       },
     },
     async paginate(fn, args) { return fn(args); },
-    async graphql(query) {
+    async graphql(query, variables = {}) {
       calls.graphql.push(query);
       if (query.includes('addProjectV2ItemById')) {
         calls.projectMutations.push('add-item');
@@ -333,6 +380,14 @@ const createSyncGithub = ({ latestIssue, title = 'Team Project', fields = projec
       }
       if (query.includes('updateProjectV2ItemFieldValue')) {
         calls.projectMutations.push('update-field');
+        calls.fieldUpdates.push(clone(variables));
+        if (onFieldUpdate) {
+          await onFieldUpdate({
+            count: calls.fieldUpdates.length,
+            variables,
+            setIssue(issue) { currentIssue = clone(issue); },
+          });
+        }
         return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM_7' } } };
       }
       if (query.includes('projectItems')) {
@@ -450,9 +505,15 @@ test('two interleaved claim events are both processed and converge on one winner
     synchronizeClaims: true,
   });
 
-  await Promise.all(logins.map((login) => runWorkflowScript('task-claim.yml', {
+  await Promise.all(logins.map((login, index) => runWorkflowScript('task-claim.yml', {
     github: githubFor(login),
-    context: claimContext(eventIssue, `认领：@${login}`, login),
+    context: claimContext(
+      eventIssue,
+      `认领：@${login}`,
+      login,
+      1000 + index,
+      `2026-07-10T01:00:${String(index).padStart(2, '0')}Z`
+    ),
     env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
   })));
 
@@ -484,9 +545,15 @@ test('a delayed contender cannot displace a winner with an earlier assignment ev
     },
   });
 
-  await Promise.all(logins.map((login) => runWorkflowScript('task-claim.yml', {
+  await Promise.all(logins.map((login, index) => runWorkflowScript('task-claim.yml', {
     github: githubFor(login),
-    context: claimContext(eventIssue, `认领：@${login}`, login),
+    context: claimContext(
+      eventIssue,
+      `认领：@${login}`,
+      login,
+      1000 + index,
+      `2026-07-10T01:00:${String(index).padStart(2, '0')}Z`
+    ),
     env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
   })));
 
@@ -494,6 +561,72 @@ test('a delayed contender cannot displace a winner with an earlier assignment ev
   assert.equal(calls.get('zara').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
   assert.equal(calls.get('alice').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 0);
   assert.deepEqual(calls.get('alice').removeAssignees[0].assignees, ['alice']);
+});
+
+test('two claim comments for the same login bind one assignment epoch to one comment token', async () => {
+  const runnerKeys = ['first', 'second'];
+  const issue = taskIssue();
+  const { state, calls, githubFor } = createClaimHarness({
+    initialIssue: issue,
+    logins: runnerKeys,
+    runnerLogins: { first: 'alice', second: 'alice' },
+    synchronizeClaims: true,
+  });
+
+  await Promise.all(runnerKeys.map((runnerKey, index) => runWorkflowScript('task-claim.yml', {
+    github: githubFor(runnerKey),
+    context: claimContext(
+      issue,
+      '认领：@alice',
+      'alice',
+      1000 + index,
+      `2026-07-10T01:00:${String(index).padStart(2, '0')}Z`
+    ),
+    env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
+  })));
+
+  assert.deepEqual(state.issue.assignees.map((assignee) => assignee.login), ['alice']);
+  assert.equal(calls.get('first').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
+  assert.equal(calls.get('second').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 0);
+  assert.equal(calls.get('second').removeAssignees.length, 0);
+  assert.equal(calls.get('second').projectUpdates.length, 0);
+});
+
+test('a new comment owns a reassigned login after the previous assignment epoch ends', async () => {
+  const issue = taskIssue({ assignees: [{ login: 'alice' }] });
+  const comments = [
+    {
+      id: 900,
+      body: '认领：@alice',
+      user: { login: 'alice' },
+      created_at: '2026-07-10T00:05:00Z',
+    },
+    {
+      id: 1000,
+      body: '认领：@alice',
+      user: { login: 'alice' },
+      created_at: '2026-07-10T01:00:00Z',
+    },
+  ];
+  const events = [
+    { id: 100, event: 'assigned', assignee: { login: 'alice' }, created_at: '2026-07-10T00:10:00Z' },
+    { id: 101, event: 'unassigned', assignee: { login: 'alice' }, created_at: '2026-07-10T00:20:00Z' },
+    { id: 102, event: 'assigned', assignee: { login: 'alice' }, created_at: '2026-07-10T01:05:00Z' },
+  ];
+  const { calls, githubFor } = createClaimHarness({
+    initialIssue: issue,
+    initialEvents: events,
+    initialComments: comments,
+  });
+
+  await runWorkflowScript('task-claim.yml', {
+    github: githubFor('alice'),
+    context: claimContext(issue, '认领：@alice', 'alice', 1000, '2026-07-10T01:00:00Z'),
+    env: { ...syncEnv, CLAIM_SETTLE_DELAY_MS: '0' },
+  });
+
+  assert.equal(calls.get('alice').comments.filter((comment) => comment.body.includes('已认领本任务')).length, 1);
+  assert.equal(calls.get('alice').removeAssignees.length, 0);
 });
 
 test('claim aborts and rolls back itself when the issue closes after assignment', async () => {
@@ -700,6 +833,36 @@ test('task sync always refreshes the issue before deciding whether it is managed
   assert.equal(calls.graphql.length, 0);
   assert.equal(calls.addLabels.length, 0);
   assert.equal(calls.update.length, 0);
+});
+
+test('task sync retries a stale Project write and converges to the latest source fingerprint', async () => {
+  const oldIssue = taskIssue();
+  const newIssue = taskIssue({
+    body: taskBody().replace(
+      '- 实际工时（小时数）：`0`',
+      '- 实际工时（小时数）：`5`'
+    ),
+  });
+  const { github, calls } = createSyncGithub({
+    latestIssue: oldIssue,
+    onFieldUpdate: async ({ count, setIssue }) => {
+      if (count === 1) setIssue(newIssue);
+    },
+  });
+
+  await runWorkflowScript('task-issue-sync.yml', {
+    github,
+    context: syncContext(oldIssue),
+    env: syncEnv,
+  });
+
+  const actualHoursWrites = calls.fieldUpdates.filter(
+    (update) => update.fieldId === 'FIELD_ActualHours'
+  );
+  assert.ok(calls.fieldUpdates.length > 10, 'the stale attempt must be followed by a full retry');
+  assert.equal(actualHoursWrites.at(-1).value.number, 5);
+  assert.match(calls.update.at(-1).body, /- 实际工时（小时数）：`5`/u);
+  assert.match(calls.update.at(-1).body, /- Project sync：`synced`/u);
 });
 
 test('task sync validates Project identity and the complete schema before mutations', async (t) => {

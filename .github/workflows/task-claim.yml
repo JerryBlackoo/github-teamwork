@@ -24,6 +24,7 @@ jobs:
         with:
           script: |
             const comment = context.payload.comment;
+            const claimTokenId = String(comment.id || '');
             const issueNumber = context.payload.issue.number;
             const commentBody = (comment.body || '').trim();
             const claimMatch = commentBody.match(/^认领\s*[:：]\s*@?([A-Za-z0-9-]+)\s*$/u);
@@ -129,13 +130,22 @@ jobs:
             };
             const readAssignmentSnapshot = async () => {
               const latestIssue = await getIssue();
-              const events = await github.paginate(github.rest.issues.listEvents, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber,
-                per_page: 100,
-              });
+              const [events, comments] = await Promise.all([
+                github.paginate(github.rest.issues.listEvents, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }),
+              ]);
               const activeAssignments = new Map();
+              const latestUnassigned = new Map();
               const orderedEvents = [...events].sort((left, right) => {
                 const timeDifference = Date.parse(left.created_at || 0) - Date.parse(right.created_at || 0);
                 if (timeDifference !== 0) return timeDifference;
@@ -145,10 +155,38 @@ jobs:
                 const login = normalizeLogin(event.assignee?.login);
                 if (!login) continue;
                 if (event.event === 'assigned' && !activeAssignments.has(login)) {
-                  activeAssignments.set(login, event);
+                  activeAssignments.set(login, { ...event, claimTokenId: '' });
                 } else if (event.event === 'unassigned') {
                   activeAssignments.delete(login);
+                  latestUnassigned.set(login, event);
                 }
+              }
+              const orderedClaimComments = comments
+                .map((candidate) => {
+                  const match = String(candidate.body || '').trim().match(/^认领\s*[:：]\s*@?([A-Za-z0-9-]+)\s*$/u);
+                  const authorLogin = normalizeLogin(candidate.user?.login);
+                  const requestedLogin = normalizeLogin(match?.[1]);
+                  return match && authorLogin === requestedLogin
+                    ? { ...candidate, claimLogin: requestedLogin }
+                    : null;
+                })
+                .filter(Boolean)
+                .sort((left, right) => {
+                  const timeDifference = Date.parse(left.created_at || 0) - Date.parse(right.created_at || 0);
+                  if (timeDifference !== 0) return timeDifference;
+                  return Number(left.id || 0) - Number(right.id || 0);
+                });
+              for (const [login, assignment] of activeAssignments) {
+                const lastUnassigned = latestUnassigned.get(login);
+                const lowerBound = lastUnassigned
+                  ? Date.parse(lastUnassigned.created_at || 0)
+                  : Number.NEGATIVE_INFINITY;
+                const upperBound = Date.parse(assignment.created_at || 0);
+                const token = orderedClaimComments.find((candidate) => {
+                  const createdAt = Date.parse(candidate.created_at || 0);
+                  return candidate.claimLogin === login && createdAt > lowerBound && createdAt <= upperBound;
+                });
+                assignment.claimTokenId = token ? String(token.id) : '';
               }
               const assigneeLogins = (latestIssue.assignees || []).map((assignee) => normalizeLogin(assignee.login));
               const assigneeSet = new Set(assigneeLogins);
@@ -189,7 +227,7 @@ jobs:
               }
               return { ok: true };
             };
-            const waitForClaimControl = async (login, requireSoleAssignee) => {
+            const waitForClaimControl = async (login, tokenId, requireSoleAssignee) => {
               const normalizedLogin = normalizeLogin(login);
               let lastSnapshot;
               for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -200,6 +238,14 @@ jobs:
                 if (!snapshot.ledgerStable || !snapshot.activeAssignments.has(normalizedLogin)) {
                   await waitForClaimSettle();
                   continue;
+                }
+                const ownAssignment = snapshot.activeAssignments.get(normalizedLogin);
+                if (!tokenId || ownAssignment.claimTokenId !== String(tokenId)) {
+                  return {
+                    ok: false,
+                    reason: `该 assignment epoch 已由 comment #${ownAssignment.claimTokenId || 'unknown'} 获得。`,
+                    snapshot,
+                  };
                 }
                 if (snapshot.winnerLogin !== normalizedLogin) {
                   return {
@@ -398,6 +444,10 @@ jobs:
               await createComment('认领失败：只能认领 open 状态的任务。');
               return;
             }
+            if (!claimTokenId) {
+              await createComment('认领失败：无法读取本次评论 ID，请重新发布认领评论。');
+              return;
+            }
             const taskStatus = readFieldFromBody(body, '状态') || 'Draft';
             if (['Blocked', 'Review', 'Done'].includes(taskStatus)) {
               await createComment(`认领失败：当前任务状态为 \`${taskStatus}\`，请先由协调人改为 \`Draft\` 或 \`Ready\` 后再认领。`);
@@ -432,7 +482,11 @@ jobs:
 
             const rememberOwnAssignment = (control) => {
               const ownEvent = control.snapshot?.activeAssignments?.get(normalizeLogin(commenterLogin));
-              if (addedByThisRun && ownAssignmentEventId === null && ownEvent) {
+              if (
+                addedByThisRun &&
+                ownAssignmentEventId === null &&
+                ownEvent?.claimTokenId === claimTokenId
+              ) {
                 ownAssignmentEventId = ownEvent.id;
               }
             };
@@ -447,6 +501,7 @@ jobs:
                 }
                 const activeEvent = snapshot.activeAssignments.get(normalizedLogin);
                 if (!activeEvent || !snapshot.assigneeLogins.includes(normalizedLogin)) return 'already-removed';
+                if (activeEvent.claimTokenId !== claimTokenId) return 'not-owned';
                 if (ownAssignmentEventId === null) ownAssignmentEventId = activeEvent.id;
                 if (String(activeEvent.id) !== String(ownAssignmentEventId)) {
                   core.setFailed(`Refusing to remove @${commenterLogin}: its active assignment no longer belongs to this run.`);
@@ -484,7 +539,7 @@ jobs:
 
             let claimControl;
             while (true) {
-              claimControl = await waitForClaimControl(commenterLogin, true);
+              claimControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
               rememberOwnAssignment(claimControl);
               if (claimControl.ok) break;
               if (await rejectAfterAssignment(claimControl, canPromoteFrom(claimControl))) return;
@@ -505,7 +560,7 @@ jobs:
             nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
             let issueFieldsUpdated = false;
             for (let attempt = 0; attempt < 3 && !issueFieldsUpdated; attempt += 1) {
-              const finalControl = await waitForClaimControl(commenterLogin, true);
+              const finalControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
               rememberOwnAssignment(finalControl);
               if (!finalControl.ok) {
                 await rejectAfterAssignment(finalControl, canPromoteFrom(finalControl));
@@ -528,7 +583,7 @@ jobs:
               });
               return;
             }
-            const committedControl = await waitForClaimControl(commenterLogin, true);
+            const committedControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
             rememberOwnAssignment(committedControl);
             const committedStatus = readFieldFromBody(committedControl.snapshot?.issue?.body || '', '状态');
             if (!committedControl.ok || committedStatus !== 'In Progress') {
