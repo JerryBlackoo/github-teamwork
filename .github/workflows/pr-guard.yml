@@ -1,7 +1,7 @@
 name: PR Guard
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 permissions:
@@ -10,13 +10,16 @@ permissions:
 
 jobs:
   guard:
-    runs-on: ubuntu-latest
+    name: PR Guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Enforce collaboration rules
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ALLOWED_BASE_BRANCHES: develop
           OWNER_DIRECT_BRANCH_USERS: ${{ github.repository_owner }}
+          TRUSTED_AUTOMATION_USERS: dependabot[bot]
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -28,6 +31,11 @@ jobs:
               .split(',')
               .map((login) => login.trim())
               .filter(Boolean);
+            const trustedAutomationUsers = (process.env.TRUSTED_AUTOMATION_USERS || '')
+              .split(',')
+              .map((login) => login.trim())
+              .filter(Boolean);
+            const isTrustedAutomation = trustedAutomationUsers.includes(pr.user.login);
             const failures = [];
 
             if (!allowedBaseBranches.includes(pr.base.ref)) {
@@ -40,7 +48,7 @@ jobs:
               const isForkPr = pr.head.repo.fork;
               const isSameRepoPr = pr.head.repo.full_name === pr.base.repo.full_name;
               const isOwnerDirectBranchPr =
-                isSameRepoPr && ownerDirectBranchUsers.includes(pr.user.login);
+                isSameRepoPr && (ownerDirectBranchUsers.includes(pr.user.login) || isTrustedAutomation);
 
               if (!isForkPr && !isOwnerDirectBranchPr) {
                 failures.push(
@@ -74,9 +82,10 @@ jobs:
             const body = pr.body || '';
             const hasCjk = /[\u3400-\u9fff]/u.test(body);
             const hasCjkTitle = /[\u3400-\u9fff]/u.test(pr.title || '');
+            const conventionalTitlePattern = /^(feat|fix|docs|style|refactor|test|chore|perf|revert)(?:\([a-z0-9._-]+\))?!?: (.+)$/u;
             const closingKeywordPattern = /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\d+\b/iu;
             const noIssueReasonPattern = /^无。原因[:：]\s*\S+/u;
-            const placeholderPattern = /(请用中文|请保留其中一种|<issue-number>|<说明|已运行必要检查)/u;
+            const placeholderPattern = /(请用中文|请保留其中一种|<issue-number>|<说明|<command>|<结果>|<原因>|<风险>|已运行必要检查)/u;
 
             const sectionValue = (heading) => {
               const pattern = new RegExp(`##\\s*${heading}\\s*\\n([\\s\\S]*?)(?=\\n##\\s+|$)`, 'u');
@@ -84,15 +93,24 @@ jobs:
               return match ? match[1].trim() : '';
             };
 
-            if (hasCjkTitle) {
+            if (!isTrustedAutomation && hasCjkTitle) {
               failures.push('PR title must use English and must not contain Chinese characters.');
             }
+            const titleMatch = String(pr.title || '').match(conventionalTitlePattern);
+            if (!isTrustedAutomation && (
+              !titleMatch ||
+              /^[A-Z]/u.test(titleMatch[2]) ||
+              titleMatch[2].endsWith('.') ||
+              pr.title.length > 72
+            )) {
+              failures.push('PR title must follow Conventional Commits, use a lowercase subject, omit the final period, and stay within 72 characters.');
+            }
 
-            if (!hasCjk) {
+            if (!isTrustedAutomation && !hasCjk) {
               failures.push('PR description must be written in Chinese.');
             }
 
-            for (const heading of ['修改内容', '关联 Issue', '验证', '已知风险']) {
+            for (const heading of isTrustedAutomation ? [] : ['修改内容', '关联 Issue', '验证', '已知风险']) {
               const value = sectionValue(heading);
               if (!value) {
                 failures.push(`PR description is missing the '${heading}' section content.`);
@@ -104,8 +122,13 @@ jobs:
             }
 
             const issueSection = sectionValue('关联 Issue');
+            const verificationSection = sectionValue('验证');
+            if (!isTrustedAutomation && verificationSection && (!/已运行\s*[:：]/u.test(verificationSection) || !/未运行\s*[:：]/u.test(verificationSection))) {
+              failures.push("'验证' must explicitly list both '已运行：' and '未运行：'.");
+            }
             const normalizedIssueSection = issueSection.replace(/^[-*]\s*/u, '').trim();
             if (
+              !isTrustedAutomation &&
               issueSection &&
               !closingKeywordPattern.test(issueSection) &&
               !noIssueReasonPattern.test(normalizedIssueSection)

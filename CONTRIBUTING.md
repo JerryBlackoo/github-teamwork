@@ -85,7 +85,7 @@ final
 5. 提交修改。
 6. 推送到个人 fork。
 7. 创建 PR 到主仓库 `develop`。
-8. 等待 CI、PR Guard、Commitlint、Codex review 和人工 review。
+8. 等待 CI、PR Guard、Commitlint、已启用的 Codex review 和人工 review。
 9. 通过后合并。
 
 常用命令：
@@ -95,7 +95,7 @@ git remote -v
 git fetch upstream --prune
 git switch -c Frontend/feat/login-page upstream/develop
 git status
-git add .
+git add <task-files>
 git commit -m "feat(frontend): add login page"
 git push -u origin Frontend/feat/login-page
 ```
@@ -107,7 +107,7 @@ gh pr create \
   --base develop \
   --head YOUR_NAME:Frontend/feat/login-page \
   --title "feat(frontend): add login page" \
-  --body-file .github/pull_request_template.md
+  --template .github/pull_request_template.md
 ```
 
 如果开发期间 `develop` 更新：

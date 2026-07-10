@@ -11,10 +11,11 @@ permissions:
 jobs:
   claim:
     if: ${{ !github.event.issue.pull_request }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Handle task comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROJECTS_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
@@ -24,8 +25,8 @@ jobs:
         with:
           script: |
             const comment = context.payload.comment;
-            const issue = context.payload.issue;
-            const body = issue.body || '';
+            const claimTokenId = String(comment.id || '');
+            const issueNumber = context.payload.issue.number;
             const commentBody = (comment.body || '').trim();
             const claimMatch = commentBody.match(/^认领\s*[:：]\s*@?([A-Za-z0-9-]+)\s*$/u);
             const actualHoursMatch = commentBody.match(/^实际工时\s*[:：]\s*(.*?)\s*$/u);
@@ -49,10 +50,14 @@ jobs:
 
             const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const cleanValue = (value) => String(value || '').trim().replace(/^`|`$/g, '').replace(/`/g, '').trim();
-            const readField = (label) => {
+            const readFieldFromBody = (issueBody, label) => {
               const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：]\\s*(.+)$`, 'imu');
-              const match = body.match(pattern);
+              const match = issueBody.match(pattern);
               return match ? cleanValue(match[1]) : '';
+            };
+            const parseTaskCode = (title) => {
+              const match = title.trim().match(/^\[([PBFDSQ]-\d{3})\]\s+.+$/u);
+              return match ? match[1] : '';
             };
             const parseHourNumber = (value, label, allowZero = true) => {
               const normalized = cleanValue(value);
@@ -71,32 +76,193 @@ jobs:
               }
               return `${issueBody.trimEnd()}\n${nextLine}\n`;
             };
+            const getIssue = async () => {
+              const response = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+              return response.data;
+            };
+            const isManagedTask = (candidate) => {
+              const candidateBody = candidate.body || '';
+              return Boolean(parseTaskCode(candidate.title || '')) &&
+                readFieldFromBody(candidateBody, 'GitHub Project') === projectName;
+            };
+            const issue = await getIssue();
+            const body = issue.body || '';
+            const taskCode = parseTaskCode(issue.title || '');
+            const configuredProject = readFieldFromBody(body, 'GitHub Project');
             const createComment = async (message) => {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: issue.number,
+                issue_number: issueNumber,
                 body: message,
               });
             };
-            const updateIssueBody = async (nextBody) => {
-              if (nextBody !== body) {
+            const updateIssueFields = async (updates, validate = () => true) => {
+              const latestIssue = await getIssue();
+              const latestBody = latestIssue.body || '';
+              if (!isManagedTask(latestIssue) || !validate(latestIssue)) {
+                core.warning(`Issue #${issueNumber} stopped matching the managed-task contract before its body update.`);
+                return false;
+              }
+              let nextBody = latestBody;
+              for (const update of updates) {
+                nextBody = replaceOrInsertField(nextBody, update.label, update.value, update.anchors);
+              }
+              if (nextBody !== latestBody) {
                 await github.rest.issues.update({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: issue.number,
+                  issue_number: issueNumber,
                   body: nextBody,
                 });
               }
+              return true;
             };
-            const parseTaskCode = (title) => {
-              const match = title.trim().match(/^\[([PBFDSQ]-\d{3})\]\s+.+$/u);
-              return match ? match[1] : '';
+            const normalizeLogin = (login) => String(login || '').toLowerCase();
+            const claimSettleDelayMs = Number.isFinite(Number(process.env.CLAIM_SETTLE_DELAY_MS))
+              ? Math.max(0, Number(process.env.CLAIM_SETTLE_DELAY_MS))
+              : 1000;
+            const waitForClaimSettle = async () => {
+              await new Promise((resolve) => setTimeout(resolve, claimSettleDelayMs));
             };
-            const readFieldFromBody = (issueBody, label) => {
-              const pattern = new RegExp(`^-\\s*${escapeRegExp(label)}\\s*[:：]\\s*(.+)$`, 'imu');
-              const match = issueBody.match(pattern);
-              return match ? cleanValue(match[1]) : '';
+            const readAssignmentSnapshot = async () => {
+              const latestIssue = await getIssue();
+              const [events, comments] = await Promise.all([
+                github.paginate(github.rest.issues.listEvents, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                }),
+              ]);
+              const activeAssignments = new Map();
+              const latestUnassigned = new Map();
+              const orderedEvents = [...events].sort((left, right) => {
+                const timeDifference = Date.parse(left.created_at || 0) - Date.parse(right.created_at || 0);
+                if (timeDifference !== 0) return timeDifference;
+                return Number(left.id || 0) - Number(right.id || 0);
+              });
+              for (const event of orderedEvents) {
+                const login = normalizeLogin(event.assignee?.login);
+                if (!login) continue;
+                if (event.event === 'assigned' && !activeAssignments.has(login)) {
+                  activeAssignments.set(login, { ...event, claimTokenId: '' });
+                } else if (event.event === 'unassigned') {
+                  activeAssignments.delete(login);
+                  latestUnassigned.set(login, event);
+                }
+              }
+              const orderedClaimComments = comments
+                .map((candidate) => {
+                  const match = String(candidate.body || '').trim().match(/^认领\s*[:：]\s*@?([A-Za-z0-9-]+)\s*$/u);
+                  const authorLogin = normalizeLogin(candidate.user?.login);
+                  const requestedLogin = normalizeLogin(match?.[1]);
+                  return match && authorLogin === requestedLogin
+                    ? { ...candidate, claimLogin: requestedLogin }
+                    : null;
+                })
+                .filter(Boolean)
+                .sort((left, right) => {
+                  const timeDifference = Date.parse(left.created_at || 0) - Date.parse(right.created_at || 0);
+                  if (timeDifference !== 0) return timeDifference;
+                  return Number(left.id || 0) - Number(right.id || 0);
+                });
+              for (const [login, assignment] of activeAssignments) {
+                const lastUnassigned = latestUnassigned.get(login);
+                const lowerBound = lastUnassigned
+                  ? Date.parse(lastUnassigned.created_at || 0)
+                  : Number.NEGATIVE_INFINITY;
+                const upperBound = Date.parse(assignment.created_at || 0);
+                const tokens = orderedClaimComments.filter((candidate) => {
+                  const createdAt = Date.parse(candidate.created_at || 0);
+                  return candidate.claimLogin === login && createdAt > lowerBound && createdAt <= upperBound;
+                });
+                const token = tokens[tokens.length - 1];
+                assignment.claimTokenId = token ? String(token.id) : '';
+              }
+              const assigneeLogins = (latestIssue.assignees || []).map((assignee) => normalizeLogin(assignee.login));
+              const assigneeSet = new Set(assigneeLogins);
+              const ledgerStable = assigneeSet.size === activeAssignments.size &&
+                [...assigneeSet].every((login) => activeAssignments.has(login));
+              const activeCandidates = [...activeAssignments.entries()]
+                .filter(([login]) => assigneeSet.has(login))
+                .sort((left, right) => {
+                  const timeDifference = Date.parse(left[1].created_at || 0) - Date.parse(right[1].created_at || 0);
+                  if (timeDifference !== 0) return timeDifference;
+                  const idDifference = Number(left[1].id || 0) - Number(right[1].id || 0);
+                  return idDifference || left[0].localeCompare(right[0]);
+                });
+              return {
+                issue: latestIssue,
+                assigneeLogins,
+                activeAssignments,
+                ledgerStable,
+                winnerLogin: activeCandidates[0]?.[0] || '',
+              };
+            };
+            const validateClaimIssue = (candidate) => {
+              if (candidate.state !== 'open') return { ok: false, reason: '任务在认领过程中已关闭。' };
+              if (!isManagedTask(candidate)) return { ok: false, reason: '任务已不再符合受管任务规则。' };
+              const candidateBody = candidate.body || '';
+              const status = readFieldFromBody(candidateBody, '状态') || 'Draft';
+              if (['Blocked', 'Review', 'Done'].includes(status)) {
+                return { ok: false, reason: `任务状态已变为 \`${status}\`。` };
+              }
+              try {
+                parseHourNumber(
+                  readFieldFromBody(candidateBody, '预期工时（小时数）') || readFieldFromBody(candidateBody, '预期工时'),
+                  '预期工时（小时数）',
+                  false
+                );
+              } catch {
+                return { ok: false, reason: '预期工时已不再是大于 0 的数字。' };
+              }
+              return { ok: true };
+            };
+            const waitForClaimControl = async (login, tokenId, requireSoleAssignee) => {
+              const normalizedLogin = normalizeLogin(login);
+              let lastSnapshot;
+              for (let attempt = 0; attempt < 20; attempt += 1) {
+                const snapshot = await readAssignmentSnapshot();
+                lastSnapshot = snapshot;
+                const eligibility = validateClaimIssue(snapshot.issue);
+                if (!eligibility.ok) return { ok: false, reason: eligibility.reason, snapshot };
+                if (!snapshot.ledgerStable || !snapshot.activeAssignments.has(normalizedLogin)) {
+                  await waitForClaimSettle();
+                  continue;
+                }
+                const ownAssignment = snapshot.activeAssignments.get(normalizedLogin);
+                if (!tokenId || ownAssignment.claimTokenId !== String(tokenId)) {
+                  return {
+                    ok: false,
+                    reason: `该 assignment epoch 已由 comment #${ownAssignment.claimTokenId || 'unknown'} 获得。`,
+                    snapshot,
+                  };
+                }
+                if (snapshot.winnerLogin !== normalizedLogin) {
+                  return {
+                    ok: false,
+                    reason: `并发认领由 @${snapshot.winnerLogin} 先完成。`,
+                    snapshot,
+                  };
+                }
+                if (requireSoleAssignee && snapshot.assigneeLogins.length !== 1) {
+                  await waitForClaimSettle();
+                  continue;
+                }
+                return { ok: true, snapshot };
+              }
+              return { ok: false, reason: '等待并发认领收敛超时。', snapshot: lastSnapshot };
             };
             const projectGraphql = async (query, variables = {}) => {
               if (!process.env.PROJECTS_TOKEN) {
@@ -118,9 +284,9 @@ jobs:
               }
               return payload.data;
             };
-            const syncProject = async (issueBody, mode, note) => {
-              const taskCode = parseTaskCode(issue.title || '');
-              if (!taskCode || !issueBody.includes('GitHub Project') || !issueBody.includes(projectName)) {
+            const syncProject = async (currentIssue, issueBody, mode, note) => {
+              const taskCode = parseTaskCode(currentIssue.title || '');
+              if (!taskCode || readFieldFromBody(issueBody, 'GitHub Project') !== projectName) {
                 core.info('Issue does not look like a managed task issue; skipping Project sync.');
                 return 'pending';
               }
@@ -145,12 +311,12 @@ jobs:
                 '实际工时（小时数）',
                 true
               );
-              const projectStatus = issue.state === 'closed'
+              const projectStatus = currentIssue.state === 'closed'
                 ? 'Done'
                 : ({ Draft: 'Todo', Ready: 'Todo', Blocked: 'In Progress', 'In Progress': 'In Progress', Review: 'In Progress', Done: 'Done' }[issueStatus] || 'Todo');
               const projectSelection = projectOwnerType === 'organization'
-                ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`
-                : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name options { id name } } } } } }`;
+                ? `organization(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`
+                : `user(login: $login) { projectV2(number: $number) { id title fields(first: 100) { nodes { ... on ProjectV2Field { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name } } } } } }`;
               const projectQuery = `query($login: String!, $number: Int!) { ${projectSelection} }`;
               const itemQuery = `query($issueId: ID!) { node(id: $issueId) { ... on Issue { projectItems(first: 50) { nodes { id project { id title } } } } } }`;
               const addItemMutation = `mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) { item { id } } }`;
@@ -159,44 +325,71 @@ jobs:
               const ownerNode = projectOwnerType === 'organization' ? projectResult.organization : projectResult.user;
               const project = ownerNode?.projectV2;
               if (!project) throw new Error(`Project '${projectName}' was not found for ${projectOwner}.`);
+              if (project.title !== projectName) {
+                throw new Error(`Project number ${projectNumber} resolved to '${project.title}', expected '${projectName}'.`);
+              }
               const fieldByName = new Map(project.fields.nodes.filter(Boolean).map((field) => [field.name, field]));
-              const itemResult = await projectGraphql(itemQuery, { issueId: issue.node_id });
+              const requireField = (fieldName, dataType) => {
+                const field = fieldByName.get(fieldName);
+                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
+                if (field.dataType !== dataType) {
+                  throw new Error(`Project field '${fieldName}' must be ${dataType}, found ${field.dataType || 'unknown'}.`);
+                }
+                return field;
+              };
+              const singleSelectUpdate = (fieldName, optionName) => {
+                const field = requireField(fieldName, 'SINGLE_SELECT');
+                const option = field.options?.find((candidate) => candidate.name === optionName);
+                if (!option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
+                return { fieldId: field.id, value: { singleSelectOptionId: option.id } };
+              };
+              const textUpdate = (fieldName, text) => {
+                const field = requireField(fieldName, 'TEXT');
+                return { fieldId: field.id, value: { text } };
+              };
+              const numberUpdate = (fieldName, hours) => {
+                const field = requireField(fieldName, 'NUMBER');
+                return { fieldId: field.id, value: { number: hours.number } };
+              };
+              const updatePlan = [];
+              if (mode === 'claim') {
+                updatePlan.push(
+                  singleSelectUpdate('Status', projectStatus),
+                  singleSelectUpdate('Group', group),
+                  singleSelectUpdate('Priority', priority),
+                  singleSelectUpdate('Batch', batch),
+                  singleSelectUpdate('Module', moduleName),
+                  singleSelectUpdate('Risk', risk),
+                  textUpdate('Dependency', dependency)
+                );
+              }
+              updatePlan.push(
+                numberUpdate('ExpectedHours', expectedHours),
+                numberUpdate('ActualHours', actualHours),
+                textUpdate('OwnerNote', note)
+              );
+
+              const itemResult = await projectGraphql(itemQuery, { issueId: currentIssue.node_id });
               let item = itemResult.node.projectItems.nodes.find((node) => node.project.id === project.id);
               if (!item) {
-                const added = await projectGraphql(addItemMutation, { projectId: project.id, contentId: issue.node_id });
+                const added = await projectGraphql(addItemMutation, { projectId: project.id, contentId: currentIssue.node_id });
                 item = added.addProjectV2ItemById.item;
               }
-              const updateSingleSelect = async (fieldName, optionName) => {
-                const field = fieldByName.get(fieldName);
-                const option = field?.options?.find((candidate) => candidate.name === optionName);
-                if (!field || !option) throw new Error(`Project field '${fieldName}' option '${optionName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { singleSelectOptionId: option.id } });
-              };
-              const updateText = async (fieldName, text) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value: { text } });
-              };
-              const updateNumber = async (fieldName, hours) => {
-                const field = fieldByName.get(fieldName);
-                if (!field) throw new Error(`Project field '${fieldName}' is unavailable.`);
-                const value = field.dataType === 'NUMBER' ? { number: hours.number } : { text: hours.text };
-                await projectGraphql(updateFieldMutation, { projectId: project.id, itemId: item.id, fieldId: field.id, value });
-              };
-              if (mode === 'claim') {
-                await updateSingleSelect('Status', projectStatus);
-                await updateSingleSelect('Group', group);
-                await updateSingleSelect('Priority', priority);
-                await updateSingleSelect('Batch', batch);
-                await updateSingleSelect('Module', moduleName);
-                await updateSingleSelect('Risk', risk);
-                await updateText('Dependency', dependency);
+              for (const update of updatePlan) {
+                await projectGraphql(updateFieldMutation, {
+                  projectId: project.id,
+                  itemId: item.id,
+                  fieldId: update.fieldId,
+                  value: update.value,
+                });
               }
-              await updateNumber('ExpectedHours', expectedHours);
-              await updateNumber('ActualHours', actualHours);
-              await updateText('OwnerNote', note);
               return 'synced';
             };
+
+            if (!taskCode || configuredProject !== projectName) {
+              core.info(`Issue #${issueNumber} is not a managed task for Project '${projectName}'; skipping task command.`);
+              return;
+            }
 
             if (actualHoursMatch) {
               let actualHours;
@@ -213,17 +406,42 @@ jobs:
                 await createComment('实际工时更新失败：只有维护者、协作者或当前 Assignee 可以设置实际工时。');
                 return;
               }
-              let nextBody = replaceOrInsertField(body, '实际工时（小时数）', actualHours.text, ['预期工时（小时数）', '模块']);
+              const issueFieldsUpdated = await updateIssueFields([
+                {
+                  label: '实际工时（小时数）',
+                  value: actualHours.text,
+                  anchors: ['预期工时（小时数）', '模块'],
+                },
+              ]);
+              if (!issueFieldsUpdated) {
+                core.setFailed(`Actual-hours update for issue #${issueNumber} was aborted because the task contract changed.`);
+                return;
+              }
+              const committedIssue = await getIssue();
+              const committedHours = readFieldFromBody(committedIssue.body || '', '实际工时（小时数）');
+              if (!isManagedTask(committedIssue) || committedHours !== actualHours.text) {
+                core.setFailed(`Actual-hours update for issue #${issueNumber} did not remain committed.`);
+                return;
+              }
               let syncState = 'blocked';
               let syncErrorMessage = '';
               try {
-                syncState = await syncProject(nextBody, 'hours', `@${comment.user.login} 通过 issue 评论更新实际工时。`);
+                syncState = await syncProject(
+                  committedIssue,
+                  committedIssue.body || '',
+                  'hours',
+                  `@${comment.user.login} 通过 issue 评论更新实际工时。`
+                );
               } catch (error) {
                 syncErrorMessage = error.message;
                 core.warning(`Project actual-hours sync failed: ${error.message}`);
               }
-              nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
-              await updateIssueBody(nextBody);
+              const finalIssue = await getIssue();
+              const finalHours = readFieldFromBody(finalIssue.body || '', '实际工时（小时数）');
+              if (!isManagedTask(finalIssue) || finalHours !== actualHours.text) {
+                core.setFailed(`Actual-hours update for issue #${issueNumber} changed during Project sync.`);
+                return;
+              }
               if (syncState === 'blocked') {
                 core.setFailed(`Updated actual hours on issue #${issue.number}, but Project sync is blocked. ${syncErrorMessage}`);
               } else {
@@ -238,7 +456,15 @@ jobs:
               await createComment(`认领失败：请使用自己的 GitHub 用户名认领，例如 \`认领：@${commenterLogin}\`。`);
               return;
             }
-            const taskStatus = readField('状态') || 'Draft';
+            if (issue.state !== 'open') {
+              await createComment('认领失败：只能认领 open 状态的任务。');
+              return;
+            }
+            if (!claimTokenId) {
+              await createComment('认领失败：无法读取本次评论 ID，请重新发布认领评论。');
+              return;
+            }
+            const taskStatus = readFieldFromBody(body, '状态') || 'Draft';
             if (['Blocked', 'Review', 'Done'].includes(taskStatus)) {
               await createComment(`认领失败：当前任务状态为 \`${taskStatus}\`，请先由协调人改为 \`Draft\` 或 \`Ready\` 后再认领。`);
               return;
@@ -249,11 +475,17 @@ jobs:
               return;
             }
             try {
-              parseHourNumber(readField('预期工时（小时数）') || readField('预期工时'), '预期工时（小时数）', false);
+              parseHourNumber(
+                readFieldFromBody(body, '预期工时（小时数）') || readFieldFromBody(body, '预期工时'),
+                '预期工时（小时数）',
+                false
+              );
             } catch {
               await createComment('认领失败：请先把 `预期工时（小时数）` 填为大于 0 的小时数，例如 `0.5`、`1` 或 `2`。');
               return;
             }
+            let addedByThisRun = false;
+            let ownAssignmentEventId = null;
             if (!(issue.assignees || []).some((assignee) => assignee.login.toLowerCase() === commenterLogin.toLowerCase())) {
               await github.rest.issues.addAssignees({
                 owner: context.repo.owner,
@@ -261,19 +493,132 @@ jobs:
                 issue_number: issue.number,
                 assignees: [commenterLogin],
               });
+              addedByThisRun = true;
             }
-            let nextBody = replaceOrInsertField(body, '状态', 'In Progress', ['编号']);
-            nextBody = replaceOrInsertField(nextBody, 'Risk', 'Normal', ['模块']);
+
+            const rememberOwnAssignment = (control) => {
+              const ownEvent = control.snapshot?.activeAssignments?.get(normalizeLogin(commenterLogin));
+              if (
+                addedByThisRun &&
+                ownAssignmentEventId === null &&
+                ownEvent?.claimTokenId === claimTokenId
+              ) {
+                ownAssignmentEventId = ownEvent.id;
+              }
+            };
+            const rollbackOwnAssignment = async (allowPromotion) => {
+              if (!addedByThisRun) return 'not-owned';
+              for (let attempt = 0; attempt < 20; attempt += 1) {
+                const snapshot = await readAssignmentSnapshot();
+                const normalizedLogin = normalizeLogin(commenterLogin);
+                if (!snapshot.ledgerStable) {
+                  await waitForClaimSettle();
+                  continue;
+                }
+                const activeEvent = snapshot.activeAssignments.get(normalizedLogin);
+                if (!activeEvent || !snapshot.assigneeLogins.includes(normalizedLogin)) return 'already-removed';
+                if (activeEvent.claimTokenId !== claimTokenId) return 'not-owned';
+                if (ownAssignmentEventId === null) ownAssignmentEventId = activeEvent.id;
+                if (String(activeEvent.id) !== String(ownAssignmentEventId)) {
+                  core.setFailed(`Refusing to remove @${commenterLogin}: its active assignment no longer belongs to this run.`);
+                  return 'ownership-changed';
+                }
+                if (allowPromotion && snapshot.winnerLogin === normalizedLogin) return 'promoted';
+                await github.rest.issues.removeAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  assignees: [commenterLogin],
+                });
+                return 'removed';
+              }
+              core.setFailed(`Could not confirm @${commenterLogin}'s assignment ownership before rollback.`);
+              return 'unstable';
+            };
+            const rejectAfterAssignment = async (control, allowPromotion = false) => {
+              rememberOwnAssignment(control);
+              const rollbackResult = await rollbackOwnAssignment(allowPromotion);
+              if (rollbackResult === 'promoted') return false;
+              const latestIssue = control.snapshot?.issue;
+              if (latestIssue && isManagedTask(latestIssue)) {
+                await createComment(`认领失败：${control.reason}`);
+              } else {
+                core.warning(`Claim for issue #${issueNumber} failed after assignment: ${control.reason}`);
+              }
+              return true;
+            };
+            const canPromoteFrom = (control) => Boolean(
+              control.snapshot?.winnerLogin &&
+              control.snapshot.winnerLogin !== normalizeLogin(commenterLogin) &&
+              validateClaimIssue(control.snapshot.issue).ok
+            );
+
+            let claimControl;
+            while (true) {
+              claimControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
+              rememberOwnAssignment(claimControl);
+              if (claimControl.ok) break;
+              if (await rejectAfterAssignment(claimControl, canPromoteFrom(claimControl))) return;
+            }
+
+            let issueFieldsUpdated = false;
+            for (let attempt = 0; attempt < 3 && !issueFieldsUpdated; attempt += 1) {
+              const finalControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
+              rememberOwnAssignment(finalControl);
+              if (!finalControl.ok) {
+                await rejectAfterAssignment(finalControl, canPromoteFrom(finalControl));
+                return;
+              }
+              issueFieldsUpdated = await updateIssueFields([
+                { label: '状态', value: 'In Progress', anchors: ['编号'] },
+                { label: 'Risk', value: 'Normal', anchors: ['模块'] },
+              ], (candidate) => {
+                const eligibility = validateClaimIssue(candidate);
+                const assignees = (candidate.assignees || []).map((assignee) => normalizeLogin(assignee.login));
+                return eligibility.ok && assignees.length === 1 && assignees[0] === normalizeLogin(commenterLogin);
+              });
+            }
+            if (!issueFieldsUpdated) {
+              await rejectAfterAssignment({
+                reason: '任务在最终写入前发生了状态或归属冲突。',
+                snapshot: { issue: await getIssue() },
+              });
+              return;
+            }
+            const committedControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
+            rememberOwnAssignment(committedControl);
+            const committedStatus = readFieldFromBody(committedControl.snapshot?.issue?.body || '', '状态');
+            if (!committedControl.ok || committedStatus !== 'In Progress') {
+              await rejectAfterAssignment({
+                ...committedControl,
+                reason: committedControl.ok ? '任务状态未能保持为 `In Progress`。' : committedControl.reason,
+              }, canPromoteFrom(committedControl));
+              return;
+            }
             let syncState = 'blocked';
             let syncErrorMessage = '';
             try {
-              syncState = await syncProject(nextBody, 'claim', `@${commenterLogin} 通过 issue 评论认领本任务。`);
+              const committedIssue = committedControl.snapshot.issue;
+              syncState = await syncProject(
+                committedIssue,
+                committedIssue.body || '',
+                'claim',
+                `@${commenterLogin} 通过 issue 评论认领本任务。`
+              );
             } catch (error) {
               syncErrorMessage = error.message;
               core.warning(`Project claim sync failed: ${error.message}`);
             }
-            nextBody = replaceOrInsertField(nextBody, 'Project sync', syncState, ['GitHub Project']);
-            await updateIssueBody(nextBody);
+            const syncedControl = await waitForClaimControl(commenterLogin, claimTokenId, true);
+            rememberOwnAssignment(syncedControl);
+            const syncedStatus = readFieldFromBody(syncedControl.snapshot?.issue?.body || '', '状态');
+            if (!syncedControl.ok || syncedStatus !== 'In Progress') {
+              await rejectAfterAssignment({
+                ...syncedControl,
+                reason: syncedControl.ok ? '任务状态在 Project 同步期间发生变化。' : syncedControl.reason,
+              }, canPromoteFrom(syncedControl));
+              return;
+            }
             if (syncState === 'blocked') {
               core.setFailed(`Assigned issue #${issue.number} to @${commenterLogin}, but Project sync is blocked. ${syncErrorMessage}`);
             } else {

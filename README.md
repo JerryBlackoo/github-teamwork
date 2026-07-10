@@ -20,14 +20,16 @@
 
 1. Fork 或复制本模板到你的项目仓库。
 2. 修改 [docs/collaboration/repository-setup.md](docs/collaboration/repository-setup.md) 中的仓库名、团队名、Project 名称和 label。
-3. 在 GitHub 创建 Project，并添加模板要求的字段。
-4. 在 GitHub 仓库设置里启用 branch protection。
-5. 在 `Settings -> Secrets and variables -> Actions` 配置必要的 secrets 和 variables。
-6. 按 [.github/ISSUE_TEMPLATE/task_issue.md](.github/ISSUE_TEMPLATE/task_issue.md) 创建第一批任务。
-7. 成员评论 `认领：@自己的GitHub用户名` 开始任务。
-8. 成员从个人 fork 分支发 PR 到 `develop`。
-9. 等待 PR Guard、Commitlint、CI、Codex review 和人工 review 通过。
-10. 合并后关闭或自动关闭 issue，Project 状态和工时同步。
+3. 创建 `develop` 分支并把它设为默认分支。
+4. 在 GitHub 创建 Project，并添加模板要求的字段。
+5. 在 GitHub 仓库设置里启用 branch protection。
+6. 替换 [.github/CODEOWNERS](.github/CODEOWNERS) 中的维护者账号，并启用 Private vulnerability reporting。
+7. 在 `Settings -> Secrets and variables -> Actions` 配置必要的 secrets 和 variables。
+8. 按 [.github/ISSUE_TEMPLATE/task_issue.md](.github/ISSUE_TEMPLATE/task_issue.md) 创建第一批任务。
+9. 成员评论 `认领：@自己的GitHub用户名` 开始任务。
+10. 成员从个人 fork 分支发 PR 到 `develop`。
+11. 等待 PR Guard、Commitlint、CI、可选 Codex review 和人工 review 通过。
+12. 合并后关闭或自动关闭 issue，Project 状态和已记录工时同步。
 
 ## 搭配 Trellis 使用
 
@@ -99,7 +101,7 @@ flowchart LR
   H --> J
   I --> J
   J --> K["合并 develop"]
-  K --> L["Issue 关闭 / Project Done / 工时回填"]
+  K --> L["Issue 关闭 / Project Done / 工时同步"]
 ```
 
 ## 需要你按项目改掉的内容
@@ -108,7 +110,10 @@ flowchart LR
 - Group 选项，默认是 `Product`、`Backend`、`Frontend`、`DevOps`、`QA`、`Special`。
 - 模块 label，默认是 `area:frontend`、`area:backend`、`area:devops`、`area:testing`、`area:docs`、`ci`。
 - PR 目标分支，默认是 `develop`。
-- Codex review 的 OpenAI endpoint 和 token。
+- 仓库默认分支，推荐设为 `develop`。
+- 是否启用 Codex review，以及对应的 OpenAI token 和可选 endpoint。
+- CODEOWNERS 中的维护者账号，以及团队的私密安全联系方式。
+- Dependabot 的目标分支、更新频率和受信自动化账号。
 - 项目自己的 CI，例如前端、后端、部署、测试命令。
 
 ## 默认安全姿态
